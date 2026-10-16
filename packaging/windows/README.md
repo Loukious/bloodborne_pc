@@ -5,6 +5,17 @@ on Linux. Players: see `README-Windows.txt` (it ships in the package).
 
 ## Build
 
+From PowerShell, an installed MSYS2 CLANG64 toolchain can also be used directly:
+
+```powershell
+./packaging/windows/build-local.ps1 -Msys2Root C:\msys64 -Jobs 8
+# Add -Package to create dist/bbport-windows.zip; -WindowsPython overrides the Python for packaging.
+```
+
+This runs the incremental local build and keeps compiler diagnostics in `out/gpu-build.log`.
+It does not commit, push, or invoke GitHub Actions. See `docs/WINDOWS_LOCAL_BUILD.md` for the
+integration build's validation and current limits.
+
 Install [MSYS2](https://www.msys2.org) (`winget install MSYS2.MSYS2`), open the
 **MSYS2 CLANG64** shell and install the toolchain and libraries (the counterpart of
 `shell.nix`):
@@ -73,5 +84,8 @@ and the presented image of the next frame to `BB_DUMP_DIR` (raw 32-bit pixels), 
 works for menus and movies.
 
 Not ported: the watchdog/`--timeout` thread dumps (Linux signals), userfaultfd tracking
-(`BB_UFFD`), MangoHud, PGO (GCC flags), the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it), and
-the `tests/` programs (several use Linux-only APIs).
+(`BB_UFFD`), Linux dma-buf guest chunks and their native allocation hooks, SIGTRAP heap diagnostics
+(`BB_FREE_CHECK`), SIGPROF thread sampling, MangoHud, PGO (GCC flags), and the GTK launcher
+(`launcher/bbport_launcher_win.py`, Tkinter, replaces it). Windows uses the pagefile-backed
+memory model and GPU buffer copies. Several existing `tests/` programs need POSIX test-harness
+adaptations on Windows.
