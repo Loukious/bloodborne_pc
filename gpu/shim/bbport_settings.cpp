@@ -9,6 +9,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace BbSettings {
 
@@ -247,10 +250,10 @@ void Save() {
     for (int e = 0; e < EffectCount; ++e) {
         put(Effects[e].key, flag(v.effects[e]));
     }
-    std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
-                 OutputWidths[v.output_res], OutputHeights[v.output_res]);
+    put("model_lod", std::to_string(v.model_lod.load()));
+    put("output_res", std::to_string(OutputWidths[v.output_res]) + "x" + std::to_string(OutputHeights[v.output_res]));
     // Read by run.py at start (hud_layout.py).
-    std::fprintf(file, "hud_position=%d\n", v.hud_position.load());
+    put("hud_position", std::to_string(v.hud_position.load()));
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
     if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {
@@ -296,7 +299,12 @@ void Save() {
     FILE* file = std::fopen(temporary.c_str(), "w");
     bool ok = file && std::fwrite(out.data(), 1, out.size(), file) == out.size();
     ok = file && std::fclose(file) == 0 && ok;
-    if (!ok || std::rename(temporary.c_str(), Path()) != 0) {
+#ifdef _WIN32
+    const bool replaced = ok && MoveFileExA(temporary.c_str(), Path(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    const bool replaced = ok && std::rename(temporary.c_str(), Path()) == 0;
+#endif
+    if (!replaced) {
         std::printf("Settings: cannot write %s\n", Path());
     }
 }

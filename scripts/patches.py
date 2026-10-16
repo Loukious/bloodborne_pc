@@ -102,6 +102,48 @@ def game_app_version(game):
         return None
 
 
+DEBUG_MENU='Restore Debug Menu (READ NOTES)'
+# What the patched game reads for the debug menu (BB_FILE_TRACE=1), under dvdroot_ps4. The game asks
+# for lower-case names; the PS4's file system and the port's runtime ignore case.
+DEBUG_MENU_FONTS=('adhoc/font/DbgFont14h.ccm','adhoc/font/DbgFont14h.tpf')
+DEBUG_MENU_SHADERS=('adhoc/FontShader/debugFont_vs.vpo','adhoc/FontShader/debugFont_ps.ppo')
+
+
+def find_ignoring_case(root, relative):
+    """`root`/`relative`, each component matched ignoring case; None when absent."""
+    path=Path(root)
+    for part in relative.split('/'):
+        exact=path/part
+        if exact.exists():
+            path=exact
+            continue
+        try:
+            matches=[e for e in path.iterdir() if e.name.casefold()==part.casefold()]
+        except OSError:
+            return None
+        if not matches:
+            return None
+        path=matches[0]
+    return path
+
+
+def debug_menu_problem(game):
+    """Why the debug menu patch cannot work with this game folder, or None."""
+    dvdroot=Path(game)/'dvdroot_ps4'
+    missing=[]
+    for relative in DEBUG_MENU_FONTS:
+        found=find_ignoring_case(dvdroot,relative)
+        if not found or not found.is_file() or found.stat().st_size==0:
+            missing.append(relative)
+    if not missing:
+        return None
+    hint=''
+    if all(find_ignoring_case(dvdroot,'font/'+r.rsplit('/',1)[1]) for r in missing):
+        hint=' (they are in dvdroot_ps4/font: the game reads them from dvdroot_ps4/adhoc/font)'
+    return ('the debug menu needs the font files from https://www.nexusmods.com/bloodborne/mods/253 '
+            f'in dvdroot_ps4 of the game folder or of a mod: missing {", ".join(missing)}{hint}')
+
+
 def validate_patch_requirements(names, game):
     """The patches to apply: raises for conflicts; drops the debug menu (with a message) when its
     font files are missing, as the game crashes opening the menu without them."""

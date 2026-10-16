@@ -156,7 +156,7 @@ static void cal_reset(void) {
 }
 /* The value each axis holds while the sticks are untouched (SDL's pre-report zeros are skipped);
  * once it is known, the largest push seen per direction on a biased axis (see cal_travel). */
-static void cal_sample(const int16_t raw[4]) {
+static __attribute__((unused)) void cal_sample(const int16_t raw[4]) {
     if (cal_have_center) {
         for (int i=0;i<4;++i) {
             if (!cal_base[i]) continue;
@@ -191,7 +191,7 @@ static void cal_sample(const int16_t raw[4]) {
  * (cal_travel) is read as -128..127, so a full push reaches full deflection in both directions
  * whatever part of SDL's range the pad uses; the inner/outer dead zone (BB_PAD_DEADZONE /
  * BB_PAD_DEADZONE_OUTER) then maps that travel to the full deflection, as shadPS4 does. */
-static uint8_t stick_axis(int axis,int16_t raw) {
+static __attribute__((unused)) uint8_t stick_axis(int axis,int16_t raw) {
     const int d=raw-cal_center[axis];
     const int travel=cal_travel(axis,d>=0 ? 1 : 0);
     int v=travel>0 ? (int)((long long)d*128/travel) : 0;
@@ -226,7 +226,7 @@ static int is_preferred(SDL_JoystickID id, const char *want) {
     char guid[33];
     SDL_GUIDToString(SDL_GetGamepadGUIDForID(id),guid,sizeof guid);
     const char *name=SDL_GetGamepadNameForID(id);
-    return !strcasecmp(guid,want) || (name && strcasestr(name,want));
+    return !strcasecmp(guid,want) || (name && SDL_strcasestr(name,want));
 }
 /* The chosen gamepad, else the first while it is not connected (checked again every second, it
  * is taken as soon as it connects); called under lock. */
@@ -616,7 +616,6 @@ static const InputConfig *active_config(void) {
 }
 
 static void sample_host(PadData *d) {
-    report_guest_heap();
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
     d->orientation[3]=1.0f;
@@ -861,9 +860,14 @@ static void replay_sample(PadData *d) {
  * name) stay hidden until released: the game would take them as a new press. */
 static int hold_after_capture;
 static void sample(PadData *d) {
+    static uint8_t next_touch_id, touch_ids[2], touch_active[2];
     reload_config_if_requested();
     sample_host(d);
-    if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
+    if (bbgpu_overlay_captures_input()) {
+        hold_after_capture=1;
+        memset(touch_active,0,sizeof(touch_active));
+        return;
+    }
     record_sample(d);
     read_inject();
     replay_sample(d);
@@ -874,6 +878,17 @@ static void sample(PadData *d) {
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
+    /* A contact keeps its ID while held; new contacts use 1..127 as on a DualShock 4. */
+    for (int i=0;i<2;++i) {
+        if (i<d->touch_count) {
+            if (!touch_active[i]) {
+                next_touch_id=(uint8_t)(next_touch_id%127+1);
+                touch_ids[i]=next_touch_id;
+            }
+            d->touches[i].id=touch_ids[i];
+        }
+        touch_active[i]=(uint8_t)(i<d->touch_count);
+    }
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;
         else hold_after_capture=0;

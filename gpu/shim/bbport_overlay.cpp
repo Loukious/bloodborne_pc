@@ -244,24 +244,6 @@ void Menu() {
             ImGui::TextUnformatted("The selected mode is active. You can select FSR 4 again.");
         ImGui::PopTextWrapPos();
     };
-    if (const char* problem = s.dlss_problem.load(); problem && s.upscaler == BbSettings::UpscalerDlss) {
-        char line[192];
-        std::snprintf(line, sizeof(line), "DLSS: %s", problem);
-        problem_text(line);
-    }
-    if (const char* problem = s.fsr4_problem.load()) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      BbSettings::MenuText("FSR 4 unavailable: %s", "FSR 4 недоступен: %s"), problem);
-        problem_text(line);
-        if (!BbSettings::IsFsr4(s.upscaler)) {
-            ImGui::PushTextWrapPos();
-            ImGui::TextUnformatted(BbSettings::MenuText(
-                "The mode selected above is active. You can select FSR 4 again.",
-                "Активен режим, выбранный выше. FSR 4 можно выбрать снова."));
-            ImGui::PopTextWrapPos();
-        }
-    }
     if (BbSettings::IsFsr4(s.upscaler)) {
         if (s.upscaler == BbSettings::UpscalerFsr411) {
             Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (requires the DLL and Proton).");
@@ -774,11 +756,6 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_active = active;
     text_entry_prompt = prompt;
     text_entry_text = text;
-}
-
-bool CapturesInput() {
-    // The text dialog too: keys typed into it (Backspace is the touchpad) stay out of the game.
-    return menu_open || prompt_active;
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {

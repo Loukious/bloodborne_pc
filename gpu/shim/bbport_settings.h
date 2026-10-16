@@ -28,28 +28,16 @@ struct Effect {
     bool default_on;
 };
 inline constexpr Effect Effects[] = {
-    {"effect_chromatic_aberration", "Chromatic aberration", true},
-    {"effect_dof", "Depth of field (DoF)", true},
-    {"effect_motion_blur", "Motion blur", true},
-    {"effect_ssao", "Ambient occlusion (SSAO)", true},
-    {"effect_game_aa", "Game anti-aliasing", true},
-    {"effect_dynamic_shadows", "Dynamic shadows", true},
-    {"effect_ssr", "Screen-space reflections (SSR)", false},
-    {"skip_intro", "Skip intro logos and movie", false},
-    {"debug_camera", "Free camera (Cross + L3)", false},
-    {"debug_menu", "Debug menu (requires font files)", false},
-    {"cheat_no_death", "Cheat: never die (minimum 1 HP)", false},
-    {"cheat_stealth", "Cheat: enemies cannot see you", false},
-    {"cheat_silent", "Cheat: enemies cannot hear you", false},
-    {"cheat_rally_no_decay", "Cheat: Rally never decays", false},
-    {"cheat_enemy_control", "Cheat: control targeted enemy (R3 / L3)", false},
-    {"tweak_no_rally", "Disable Rally (health recovery)", false},
-    {"tweak_camera_distance", "Increase camera distance", false},
-    {"tweak_no_camera_rotation", "Disable automatic camera rotation", false},
-    {"tweak_easy_run", "Run with less stick tilt", false},
-    {"tweak_ragdoll", "Dark Souls-style ragdoll physics", false},
-    {"tweak_circle_confirm", "Japanese/Asian buttons (Circle confirms)", false},
-    {"quit_to_desktop", "Quit to Desktop in the title and System menus", true},
+    {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", true},
+    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
+    {"effect_motion_blur", "Motion blur", "Размытие в движении", true},
+    {"effect_ssao", "Ambient occlusion (SSAO)", "Затенение SSAO", true},
+    {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", true},
+    {"effect_dynamic_shadows", "Shadows from dynamic lights", "Тени от динамических источников", true},
+    {"effect_ssr", "Screen-space reflections (not in original game)", "Отражения SSR (не было в игре)", false},
+    {"skip_intro", "Skip startup intros", "Пропуск заставок при запуске", false},
+    {"debug_camera", "Free camera (Cross + L3)", "Свободная камера (Cross + L3)", false},
+    {"debug_menu", "Debug menu (requires font files)", "Debug menu (нужны файлы шрифтов)", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Output resolutions: the upscaler's output and the UI host targets. The 16:9 ones change

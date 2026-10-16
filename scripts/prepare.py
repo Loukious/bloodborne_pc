@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import struct
 import sys
+import game_check
 
 # Path.read_text()/write_text() default to the process locale encoding. Game
 # metadata and config files can contain characters that locale cannot encode
