@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #endif
@@ -40,6 +41,42 @@ static int gpu_enabled;
 int vulkan_smoke(void);
 
 static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+
+/* The game's code was compiled for the PS4's CPU (AMD Jaguar) and runs as it is: AVX, BMI1
+ * (andn/bextr/blsr/tzcnt), MOVBE, LZCNT and POPCNT, thousands of each in eboot.bin. A CPU without
+ * them stops at the first one with SIGILL (exit code 132, issue #26), and lzcnt/tzcnt even run as
+ * bsr/bsf there, with other results. Said before the game starts; BB_SKIP_CPU_CHECK=1 skips it. */
+static void check_cpu(void) {
+    const char *skip = getenv("BB_SKIP_CPU_CHECK");
+    if (skip && !strcmp(skip, "1")) return;
+    unsigned a, b, c, d, leaf1_c = 0, leaf7_b = 0, ext1_c = 0;
+    if (__get_cpuid(1, &a, &b, &c, &d)) leaf1_c = c;
+    if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) leaf7_b = b;
+    if (__get_cpuid(0x80000001u, &a, &b, &c, &d)) ext1_c = c;
+    int avx = (leaf1_c & bit_AVX) && (leaf1_c & bit_OSXSAVE);
+    if (avx) {
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        avx = (lo & 6) == 6; /* the OS saves SSE and AVX state */
+    }
+    const struct { int present; const char *name; } features[] = {
+        {avx, "AVX"}, {(leaf7_b & bit_BMI) != 0, "BMI1"}, {(leaf1_c & bit_MOVBE) != 0, "MOVBE"},
+        {(ext1_c & bit_LZCNT) != 0, "LZCNT"}, {(leaf1_c & bit_POPCNT) != 0, "POPCNT"},
+        {(leaf1_c & bit_SSE4_2) != 0, "SSE4.2"},
+    };
+    char missing[64] = "";
+    for (unsigned i = 0; i < sizeof(features) / sizeof(features[0]); ++i) {
+        if (features[i].present) continue;
+        if (missing[0]) strcat(missing, ", ");
+        strcat(missing, features[i].name);
+    }
+    if (!missing[0]) return;
+    fprintf(stderr,
+            "ERROR: this CPU lacks %s. Bloodborne's code was compiled for the PS4's CPU and uses "
+            "these instructions directly: it needs an Intel Haswell (4th generation Core, 2013) or "
+            "newer, or an AMD Ryzen. BB_SKIP_CPU_CHECK=1 starts anyway.\n", missing);
+    exit(1);
+}
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -273,6 +310,26 @@ static void fault(int sig, siginfo_t *info, void *context) {
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    /* Outside the image and any shared object (generated code, a freed mapping): the mapping
+     * from /proc/self/maps, and the thread. */
+    if (rip - (uintptr_t)image >= 0x10000000 && !(dladdr((void *)rip, &where) && where.dli_fname)) {
+        char thread[32] = "?";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        snprintf(line, sizeof(line), "  thread %s; mapping of RIP: ", thread);
+        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+        FILE *maps = fopen("/proc/self/maps", "r");
+        int found = 0;
+        while (maps && fgets(line, sizeof(line), maps)) {
+            unsigned long from, to;
+            if (sscanf(line, "%lx-%lx", &from, &to) == 2 && rip >= from && rip < to) {
+                ssize_t written_=write(2, line, strlen(line)); (void)written_;
+                found = 1;
+                break;
+            }
+        }
+        if (maps) fclose(maps);
+        if (!found) { ssize_t written_=write(2, "none\n", 5); (void)written_; }
+    }
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
@@ -402,6 +459,7 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
+volatile int runtime_restarting;
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32

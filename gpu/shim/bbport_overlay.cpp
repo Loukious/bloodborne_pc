@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_overlay.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -8,6 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
@@ -56,16 +60,32 @@ bool dirty = false; // settings changed while open: saved on close
 bool text_entry_active = false;
 std::string text_entry_prompt, text_entry_text;
 float base_scale = 1.0f;
+// The game's text dialog (ImeDialog, the character name), typed on the keyboard: drawn while it
+// is open. In fullscreen the window title that showed it is not visible (issues #17, #19).
+std::mutex prompt_mutex;
+std::atomic<bool> prompt_active{false};
+std::string prompt_title, prompt_text;
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
 
+float PixelDensity(SDL_WindowID id);
+
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
     }
-    ImGui::GetIO().MouseDrawCursor = value;
+    // The system cursor shows over the menu (window.cpp); ImGui learns where it is now, not at
+    // the next motion: mouse motion is not passed on while the menu is closed.
+    if (value) {
+        if (SDL_Window* window = SDL_GetMouseFocus()) {
+            float x = 0.0f, y = 0.0f;
+            SDL_GetMouseState(&x, &y);
+            const float density = PixelDensity(SDL_GetWindowID(window));
+            ImGui::GetIO().AddMousePosEvent(x * density, y * density);
+        }
+    }
     if (!value && dirty) {
         dirty = false;
         BbSettings::Save();
@@ -155,12 +175,21 @@ void Hint(const char* text) {
     }
 }
 
+// The settings menu as in 0.3 and 0.4: one window (moved with the mouse, its place kept in
+// bbport.ini), sections one under the other, ImGui's own widgets and keyboard/gamepad navigation.
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 40.0f * base_scale,
-                                   viewport->WorkPos.y + 40.0f * base_scale),
-                            ImGuiCond_Appearing);
+    // Where it was moved last (bbport.ini menu_pos, a fraction of the screen), kept on screen.
+    ImVec2 pos(viewport->WorkPos.x + 40.0f * base_scale, viewport->WorkPos.y + 40.0f * base_scale);
+    if (s.menu_x >= 0.0f && s.menu_y >= 0.0f) {
+        const float margin = 80.0f * base_scale;
+        pos.x = viewport->WorkPos.x +
+                std::clamp(s.menu_x * viewport->WorkSize.x, 0.0f, std::max(viewport->WorkSize.x - margin, 0.0f));
+        pos.y = viewport->WorkPos.y +
+                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
+    }
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
     // A menu taller than the screen would leave its last row (Close) off screen: the window
     // stays within the screen (below its 40 px offset) and scrolls instead.
@@ -214,6 +243,24 @@ void Menu() {
         if (!BbSettings::IsFsr4(s.upscaler))
             ImGui::TextUnformatted("The selected mode is active. You can select FSR 4 again.");
         ImGui::PopTextWrapPos();
+    };
+    if (const char* problem = s.dlss_problem.load(); problem && s.upscaler == BbSettings::UpscalerDlss) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "DLSS: %s", problem);
+        problem_text(line);
+    }
+    if (const char* problem = s.fsr4_problem.load()) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      BbSettings::MenuText("FSR 4 unavailable: %s", "FSR 4 недоступен: %s"), problem);
+        problem_text(line);
+        if (!BbSettings::IsFsr4(s.upscaler)) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextUnformatted(BbSettings::MenuText(
+                "The mode selected above is active. You can select FSR 4 again.",
+                "Активен режим, выбранный выше. FSR 4 можно выбрать снова."));
+            ImGui::PopTextWrapPos();
+        }
     }
     if (BbSettings::IsFsr4(s.upscaler)) {
         if (s.upscaler == BbSettings::UpscalerFsr411) {
@@ -350,15 +397,25 @@ void Menu() {
         ImGui::EndCombo();
     }
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(BbSettings::Effects[e].label, s.effects[e]);
+        const auto& effect = BbSettings::Effects[e];
+        Checkbox(BbSettings::MenuText(effect.label, effect.label_ru), s.effects[e]);
+        if (std::string_view(effect.key) == "debug_camera") {
+            Hint(BbSettings::MenuText("Hold Cross and press L3 (keyboard: Space + Z).",
+                                      "Удерживайте Cross и нажмите L3 (клавиатура: Space + Z)."));
+        } else if (std::string_view(effect.key) == "debug_menu") {
+            Hint(BbSettings::MenuText(
+                "Left side of the touchpad (Tab); right side: Backspace. Needs the adhoc folder "
+                "from Nexus mod #253 (the fonts in adhoc/font).",
+                "Левая сторона тачпада (Tab), правая — Backspace. Нужна папка adhoc из мода "
+                "Nexus #253 (шрифты в adhoc/font)."));
+        }
     }
     Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
     Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
 
-    bool restart = s.object_motion != s.startup_object_motion ||
-                   s.model_lod != s.startup_model_lod ||
-                   s.live_resolution != s.startup_live_resolution ||
-                   BbSettings::ResolutionNeedsRestart();
+    bool restart =
+        s.object_motion != s.startup_object_motion || s.model_lod != s.startup_model_lod ||
+        s.live_resolution != s.startup_live_resolution || BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         restart |= s.effects[e] != s.startup_effects[e];
     }
@@ -431,9 +488,9 @@ void TextEntryBox() {
 void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
-                                   viewport->WorkPos.y + pad),
-                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad),
+        ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     ImGui::SetNextWindowBgAlpha(0.5f);
     ImGui::Begin("##fps", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -451,7 +508,93 @@ void FpsCounter() {
     ImGui::End();
 }
 
+void TextPrompt() {
+    std::string title, text;
+    {
+        std::scoped_lock lock{prompt_mutex};
+        title = prompt_title;
+        text = prompt_text;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    ImGui::Begin("##textprompt", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::Separator();
+    ImGui::Text("%s_", text.c_str());
+    ImGui::Separator();
+    ImGui::TextUnformatted("Keyboard: type, Backspace = delete, Enter = OK, Esc = cancel");
+    ImGui::End();
+}
+
+/// BB_MENU_KEYS_FILE=<file> (scripted tests): tokens toggle up down left right enter back l1 r1,
+/// consumed when the file appears (it is removed), one key press per frame.
+void ScriptedKeys() {
+    static const char* path = std::getenv("BB_MENU_KEYS_FILE");
+    static std::chrono::steady_clock::time_point last_check{};
+    static std::vector<std::string> queue;
+    static bool release = false;
+    static ImGuiKey held = ImGuiKey_None;
+    if (!path) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    if (release) {
+        io.AddKeyEvent(held, false);
+        release = false;
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (queue.empty() && now - last_check > std::chrono::milliseconds(100)) {
+        last_check = now;
+        if (FILE* f = std::fopen(path, "r")) {
+            char token[32];
+            while (std::fscanf(f, "%31s", token) == 1) {
+                queue.emplace_back(token);
+            }
+            std::fclose(f);
+            std::remove(path);
+        }
+    }
+    if (queue.empty()) {
+        return;
+    }
+    const std::string token = queue.front();
+    queue.erase(queue.begin());
+    if (token == "toggle") {
+        SetOpen(!menu_open);
+        return;
+    }
+    held = token == "up" ? ImGuiKey_GamepadDpadUp : token == "down" ? ImGuiKey_GamepadDpadDown
+         : token == "left" ? ImGuiKey_GamepadDpadLeft : token == "right" ? ImGuiKey_GamepadDpadRight
+         : token == "enter" ? ImGuiKey_GamepadFaceDown : token == "l1" ? ImGuiKey_GamepadL1
+         : token == "r1" ? ImGuiKey_GamepadR1 : token == "kdown" ? ImGuiKey_DownArrow
+         : token == "kup" ? ImGuiKey_UpArrow : ImGuiKey_None;
+    if (token == "back") {
+        SetOpen(false);
+        return;
+    }
+    if (held != ImGuiKey_None) {
+        io.AddKeyEvent(held, true);
+        release = true;
+    }
+}
+
 } // namespace
+
+void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
+    {
+        std::scoped_lock lock{prompt_mutex};
+        prompt_title = prompt;
+        prompt_text = text;
+    }
+    prompt_active = active;
+}
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
@@ -633,13 +776,23 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
+bool CapturesInput() {
+    // The text dialog too: keys typed into it (Backspace is the touchpad) stay out of the game.
+    return menu_open || prompt_active;
+}
+
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+
     // Present interval for the FPS readout (measured also while nothing is drawn).
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
     last_present = now;
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+    }
+    if (std::getenv("BB_MENU_KEYS_FILE") && initialized) {
+        std::scoped_lock lock{imgui_mutex};
+        ScriptedKeys();
     }
     if (!Visible()) {
         return;

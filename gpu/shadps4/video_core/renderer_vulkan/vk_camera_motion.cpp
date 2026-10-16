@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,28 @@ std::array<float, 12> Multiply(const std::array<float, 12>& a, const std::array<
             }
             out[r * 4 + c] = v;
         }
+    }
+    return out;
+}
+
+/// The inverse of a 3x4 affine matrix [M | t]: [M^-1 | -M^-1 t].
+std::array<float, 12> InverseAffine(const std::array<float, 12>& m) {
+    const float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9],
+                i = m[10];
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (std::abs(det) < 1e-12f) {
+        return m;
+    }
+    const float s = 1.0f / det;
+    const std::array<float, 9> r = {(e * i - f * h) * s, (c * h - b * i) * s, (b * f - c * e) * s,
+                                    (f * g - d * i) * s, (a * i - c * g) * s, (c * d - a * f) * s,
+                                    (d * h - e * g) * s, (b * g - a * h) * s, (a * e - b * d) * s};
+    std::array<float, 12> out{};
+    for (int row = 0; row < 3; ++row) {
+        out[row * 4 + 0] = r[row * 3 + 0];
+        out[row * 4 + 1] = r[row * 3 + 1];
+        out[row * 4 + 2] = r[row * 3 + 2];
+        out[row * 4 + 3] = -(r[row * 3 + 0] * m[3] + r[row * 3 + 1] * m[7] + r[row * 3 + 2] * m[11]);
     }
     return out;
 }
@@ -153,12 +176,29 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
 CameraMotion::~CameraMotion() = default;
 
 float CameraMotion::VerticalFov() const noexcept {
-    return 2.0f * std::atan(1.0f / current.proj[1]);
+    return 2.0f * std::atan(1.0f / std::abs(current.proj[1]));
 }
 
 float CameraMotion::Near() const noexcept {
     // depth = zs + zo / z is 0 at the near plane.
     return -current.proj[3] / current.proj[2];
+}
+
+void CameraMotion::PrintState(int frame) const {
+    const auto print = [](const char* name, const float* v, int n) {
+        std::printf(" %s", name);
+        for (int i = 0; i < n; ++i) {
+            std::printf(" %.9g", v[i]);
+        }
+    };
+    std::printf("Dump camera: frame %d", frame);
+    print("view", current.view.data(), 12);
+    print("prev_view", previous.view.data(), 12);
+    print("proj", current.proj.data(), 4);
+    print("prev_proj", previous.proj.data(), 4);
+    print("jitter", jitter.data(), 2);
+    print("prev_jitter", previous_jitter.data(), 2);
+    std::printf("\n");
 }
 
 std::array<std::array<float, 4>, 3> CameraMotion::TaaDepthParameters() const noexcept {
@@ -176,11 +216,12 @@ vk::Image CameraMotion::ObjectMotionImage(u32 width, u32 height) const noexcept 
                                                       : vk::Image{};
 }
 
-void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
-                                vk::ImageView motion_view, u32 width, u32 height) {
+void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_view, u32 width,
+                                u32 height) {
+    CommitFrameCamera();
     bool object_valid = false;
     const vk::ImageView object_view = object_motion && object_motion->Enabled()
-        ? object_motion->PrepareRead(cmdbuf, width, height, object_valid) : depth_view;
+        ? object_motion->PrepareRead(width, height, object_valid) : depth_view;
     const PushConstants push{
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
@@ -190,32 +231,36 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         .previous_jitter = previous_jitter,
         .mode = object_valid ? 1u : 0u,
     };
-    const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
-                                             .imageLayout = vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
-                                              .imageLayout = vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo object_info{.imageView = object_view,
-                                              .imageLayout = vk::ImageLayout::eGeneral};
-    const std::array<vk::WriteDescriptorSet, 3> writes = {{
-        {.dstBinding = 0,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eSampledImage,
-         .pImageInfo = &depth_info},
-        {.dstBinding = 1,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eStorageImage,
-         .pImageInfo = &motion_info},
-        {.dstBinding = 2,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eSampledImage,
-         .pImageInfo = &object_info},
-    }};
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pipeline);
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_pipeline_layout, 0,
-                                writes);
-    cmdbuf.pushConstants(*motion_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                         sizeof(push), &push);
-    cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    // bbport: everything the pass reads is captured: it may be recorded on a recording thread
+    // while this thread goes on with the next frame's camera.
+    scheduler.RecordCrumb({.name = "camera motion"}, [push, depth_view, motion_view, object_view, width, height,
+                      pipeline = *motion_pipeline,
+                      layout = *motion_pipeline_layout](vk::CommandBuffer cmdbuf) {
+        const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
+                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
+                                                  .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo object_info{.imageView = object_view,
+                                                  .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 3> writes = {{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .pImageInfo = &depth_info},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .pImageInfo = &motion_info},
+            {.dstBinding = 2,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .pImageInfo = &object_info},
+        }};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+        cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    });
 }
 
 void CameraMotion::OnConstants(const float* data) {
@@ -224,8 +269,11 @@ void CameraMotion::OnConstants(const float* data) {
         std::abs(data[1] * data[0] - 1.0f) > 1e-3f) {
         return;
     }
-    if (frame_has_camera) {
-        return; // the first one of a frame is the main camera
+    // bbport: the first constants of each G-buffer pass are its camera. A frame may have more
+    // than one such pass (another camera before the main scene): the camera goes with the pass
+    // whose depth the motion vectors use (CommitFrameCamera), not with the frame's first pass.
+    if (pass_has_camera) {
+        return;
     }
     previous = current;
     std::memcpy(current.view.data(), data + 8, 12 * sizeof(float));
@@ -250,19 +298,60 @@ void CameraMotion::OnConstants(const float* data) {
         std::printf("Camera motion: scene render size %ux%u\n", size[0], size[1]);
         render_size = size;
     }
+    pass_has_camera = true;
     frame_has_camera = true;
+    if (frame_gbuffer_passes <= pass_positions.size() && frame_gbuffer_passes > 0) {
+        // World position of this pass's camera (diagnostics: frames with several passes).
+        const auto& v = pass_camera.view;
+        pass_positions[frame_gbuffer_passes - 1] = {
+            -(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]),
+            -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
+            -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11])};
+    }
 }
 
-void CameraMotion::OnGBufferPass(VideoCore::ImageId depth) {
-    depth_id = depth;
+void CameraMotion::OnGBufferPass(VideoCore::ImageId depth, float x_sign, float y_sign) {
+    if (depth != depth_id) {
+        // Another depth target: another G-buffer pass, with its own camera.
+        depth_id = depth;
+        pass_has_camera = false;
+        ++frame_gbuffer_passes;
+    }
+    gbuffer_x_sign = x_sign;
+    gbuffer_y_sign = y_sign;
+}
+
+void CameraMotion::CommitFrameCamera() {
+    if (committed || !pass_has_camera) {
+        return;
+    }
+    previous = current;
+    current = pass_camera;
+    committed = true;
 }
 
 void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
+    CommitFrameCamera();
     if (debug_overlay && frame && depth_id && current.valid && previous.valid) {
         Overlay(frame);
     }
+    if (frame_gbuffer_passes > 1) {
+        static auto next = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now(); now >= next) {
+            next = now + std::chrono::seconds(2);
+            std::printf("Camera motion: %u G-buffer passes this frame, cameras at", frame_gbuffer_passes);
+            for (u32 i = 0; i < std::min<u32>(frame_gbuffer_passes, pass_positions.size()); ++i) {
+                std::printf(" (%.2f %.2f %.2f)", pass_positions[i][0], pass_positions[i][1],
+                            pass_positions[i][2]);
+            }
+            std::printf("; the last pass's camera goes with its depth\n");
+        }
+    }
     if (!frame_has_camera) InvalidateHistory();
     frame_has_camera = false;
+    pass_has_camera = false;
+    committed = false;
+    frame_gbuffer_passes = 0;
     depth_id = {};
 }
 
@@ -363,6 +452,7 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
          .pBufferInfo = &next_info},
     }};
     const auto cmdbuf = scheduler.CommandBuffer();
+    const Breadcrumbs::Scope crumb{cmdbuf, scheduler.CrumbStream(), "motion overlay"};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *overlay_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, writes);
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),

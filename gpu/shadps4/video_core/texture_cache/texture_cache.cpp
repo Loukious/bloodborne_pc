@@ -5,6 +5,7 @@
 
 #include "bbport_process_memory.h"
 #include "bbport_toggles.h"
+#include "bbport_free_check.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -64,8 +65,35 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
+std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
+    std::unique_lock lock{mutex, std::try_to_lock}; // the caller may hold it already
+    if (!lock.owns_lock()) {
+        return " [images: not looked up]";
+    }
+    std::string out;
+    int shown = 0;
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        if (shown++ < 3) {
+            out += fmt::format(" [image {:#x}+{:#x} {}x{} fmt {} tile {}{}{}]", image.info.guest_address,
+                               image.info.guest_size, image.info.size.width,
+                               image.info.size.height, u32(image.info.pixel_format),
+                               u32(image.info.tile_mode), image.usage.render_target ? " RT" : "",
+                               True(image.flags & ImageFlagBits::GpuModified) ? " gpu" : "");
+        }
+    });
+    if (shown > 3) {
+        out += fmt::format(" +{} more", shown - 3);
+    }
+    return out;
+}
+
 void TextureCache::ProcessDownloadImages() {
+    // bbport: called for every fence (~450 a frame): the lock only when something is queued.
+    if (!downloads_queued.load(std::memory_order_acquire)) {
+        return;
+    }
     std::unique_lock lk{download_images_mutex};
+    downloads_queued.store(false, std::memory_order_relaxed);
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
@@ -80,6 +108,36 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    vk::BufferImageCopy image_copy = {
+        .bufferOffset = 0,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    // bbport BB_GUEST_IN_PLACE: the GPU copies the image into the game's memory itself, in stream
+    // order: before the fences that follow, no wait here and no CPU copy afterwards.
+    // Where the memory has a VRAM copy the GPU copies into that copy as well: buffers bound over
+    // it read the image's data in stream order (issue #122: motion blur read a render target as a
+    // buffer, 0x104ff00000, from a VRAM copy refreshed only once the CPU copy below landed, frames
+    // later: the frame smeared while the camera turned). The game's memory still gets it below.
+    if (GuestInPlace() && image.info.guest_address != 0) {
+        const auto [arena, offset] =
+            buffer_cache.ObtainBuffer(image.info.guest_address, download_size, true);
+        image_copy.bufferOffset = offset;
+        runtime.DownloadImage(&image, arena, std::span{&image_copy, 1});
+        if (buffer_cache.IsInPlace(image.info.guest_address, download_size)) {
+            return;
+        }
+    }
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
@@ -101,14 +159,24 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        BbFreeCheck::Check(image.info.guest_address, download_size, download.mapped,
+                           BbFreeCheck::ImageDownload);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
+        if (!WriteTracking()) {
+            buffer_cache.InvalidateMemory(image.info.guest_address, download_size);
+        }
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 download.Invalidate();
+                BbFreeCheck::Check(device_addr, download_size, download.mapped,
+                                   BbFreeCheck::ImageDownload);
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
+                if (!WriteTracking()) {
+                    buffer_cache.InvalidateMemory(device_addr, download_size);
+                }
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
@@ -142,6 +210,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            PageManager::NoteImageFault(image.info.guest_address, image.info.guest_size,
+                                        image.info.size.width, image.info.size.height,
+                                        u32(image.info.pixel_format), u32(image.info.tile_mode));
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -162,15 +233,45 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
+// bbport BB_IMAGE_WATCH=addr (diagnostics): how the image at that address is used (first 300).
+void TextureCache::WatchImage(const Image& image, const char* what) {
+    static const u64 watched = [] {
+        const char* env = std::getenv("BB_IMAGE_WATCH");
+        return env ? std::strtoull(env, nullptr, 0) : 0ull;
+    }();
+    if (!watched || image.info.guest_address != watched) {
+        return;
+    }
+    static std::atomic<u32> printed{0};
+    if (printed.fetch_add(1) < 300) {
+        std::printf("Image watch %#llx: %s, flags %#x\n", (unsigned long long)watched, what,
+                    u32(image.flags));
+    }
+}
+
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
-    ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+    // bbport: only an image starting at `address` is affected, so the images over its first byte
+    // are all there is to look at (the whole range was walked for every GPU write binding).
+    ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
+        static const bool log = std::getenv("BB_IMAGE_SYNC_LOG") != nullptr;
+        if (log) {
+            static std::atomic<u32> printed{0};
+            if (printed.fetch_add(1) < 200) {
+                std::printf("Image sync: GPU write %#llx+%#llx over image %#llx %ux%u fmt %u flags %#x%s\n",
+                            (unsigned long long)address, (unsigned long long)max_size,
+                            (unsigned long long)image.info.guest_address, image.info.size.width,
+                            image.info.size.height, u32(image.info.pixel_format), u32(image.flags),
+                            image.info.guest_address == address ? "" : " (not at its start: kept)");
+            }
+        }
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
+        WatchImage(image, "GPU write (marked for refresh)");
         image.flags |= ImageFlagBits::GpuDirty;
     });
 }
@@ -680,12 +781,15 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
                                      bool refresh) {
     Image& image = slot_images[image_id];
+    WatchImage(image, refresh ? "texture (refresh)" : "texture (no refresh)");
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
+        image.gpu_write_tick = scheduler.CurrentTick();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
+            downloads_queued.store(true, std::memory_order_release);
         }
     }
     if (refresh) {
@@ -709,10 +813,13 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    WatchImage(image, "render target");
     image.flags |= ImageFlagBits::GpuModified;
+    image.gpu_write_tick = scheduler.CurrentTick();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
+        downloads_queued.store(true, std::memory_order_release);
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -735,7 +842,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    WatchImage(image, "depth target");
     image.flags |= ImageFlagBits::GpuModified;
+    image.gpu_write_tick = scheduler.CurrentTick();
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -775,6 +884,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    WatchImage(image, "refresh entered");
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -797,7 +907,50 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+    static const bool sync_log = std::getenv("BB_IMAGE_SYNC_LOG") != nullptr;
+    if (sync_log && is_gpu_dirty) {
+        static std::atomic<u32> printed{0};
+        if (printed.fetch_add(1) < 100) {
+            std::printf("Image sync: refresh of %#llx (%ux%u) from memory the GPU wrote, flags %#x\n",
+                        (unsigned long long)image.info.guest_address, image.info.size.width,
+                        image.info.size.height, u32(image.flags));
+        }
+    }
 
+    if (sync_log) {
+        // BB_IMAGE_SYNC_LOG: the images refreshed most per 5 s (any reason), with their flags.
+        struct Refreshes {
+            u64 count = 0, bytes = 0;
+            u32 width = 0, height = 0, format = 0, tiling = 0, flags = 0;
+        };
+        static std::mutex refresh_mutex;
+        static std::unordered_map<VAddr, Refreshes> refreshes;
+        static auto window_start = std::chrono::steady_clock::now();
+        std::scoped_lock lk{refresh_mutex};
+        auto& r = refreshes[image.info.guest_address];
+        r = {r.count + 1,
+             r.bytes + image.info.guest_size,
+             image.info.size.width,
+             image.info.size.height,
+             u32(image.info.pixel_format),
+             u32(image.info.tile_mode),
+             r.flags | u32(image.flags)};
+        if (const auto now = std::chrono::steady_clock::now();
+            now - window_start >= std::chrono::seconds(5)) {
+            std::vector<std::pair<VAddr, Refreshes>> top(refreshes.begin(), refreshes.end());
+            std::ranges::sort(top, std::greater{}, [](const auto& e) { return e.second.bytes; });
+            std::string text;
+            for (size_t i = 0; i < std::min<size_t>(top.size(), 5); ++i) {
+                const auto& [address, e] = top[i];
+                text += fmt::format(" {:#x} {}x{} fmt {} tile {}: {}x {:.0f} MB flags {:#x};",
+                                    address, e.width, e.height, e.format, e.tiling, e.count,
+                                    e.bytes / 1e6, e.flags);
+            }
+            std::printf("Image refreshes (5 s, %zu images):%s\n", refreshes.size(), text.c_str());
+            refreshes.clear();
+            window_start = now;
+        }
+    }
     BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -845,6 +998,7 @@ void TextureCache::RefreshImage(Image& image) {
         });
     }
 
+    WatchImage(image, image_copies.empty() ? "refresh: nothing to copy" : "refresh: uploading");
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
@@ -1187,6 +1341,7 @@ void TextureCache::GarbageCollectImages() {
             ++gc_downloads;
         }
         ++gc_evictions;
+        BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1275,6 +1430,13 @@ void TextureCache::GarbageCollectSamplers() {
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+}
+
+void TextureCache::NoteVramShort() {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+    vram_short_until.store(now + 30, std::memory_order_relaxed);
 }
 
 void TextureCache::RunGarbageCollector() {

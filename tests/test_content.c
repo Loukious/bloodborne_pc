@@ -106,6 +106,6 @@ int main(int argc,char **argv) {
     assert((uint32_t)init(initial,b.boot)==0x80d90003);
     assert(unload(0xb4)==0 && (uint32_t)loaded(0xb4)==0x805a1001);
     assert(load(0xb4)==0 && init(initial,b.boot)==0 && unload(0xb4)==0);
-    puts("PASS: AppContent lifecycle, profile and output boundaries");
+    puts("PASS: AppContent lifecycle, profile, add-on folders and output boundaries");
     return 0;
 }

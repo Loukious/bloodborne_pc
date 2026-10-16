@@ -10,10 +10,14 @@ import stat
 import sys
 import tempfile
 
-# Top-level folders of the game's dvdroot_ps4: a mod made of these is a dvdroot_ps4 itself.
-GAME_FOLDERS = {'action', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
+# Top-level folders of the game's dvdroot_ps4: a mod made of these is a dvdroot_ps4 itself (adhoc:
+# the debug menu's fonts, which the retail game does not ship).
+GAME_FOLDERS = {'action', 'adhoc', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
                 'obj', 'other', 'param', 'paramdef', 'parts', 'remo', 'script', 'sfx', 'shader',
                 'sound'}
+# The retail releases' folder names (game_check.py SUPPORTED_TITLES), as a mod's wrapper folder.
+SERIALS = ('CUSA03173', 'CUSA00900', 'CUSA00207', 'CUSA00208', 'CUSA00299', 'CUSA01363',
+           'CUSA03179', 'CUSA03014', 'CUSA03023')
 
 
 def child(folder, name):

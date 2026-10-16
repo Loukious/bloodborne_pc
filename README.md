@@ -46,6 +46,32 @@ https://nativeretro.com/
 - **Text and voice language** chosen separately, Brazilian Portuguese text included.
 - **Achievements page** in the launcher with the trophies you have earned, updated live.
 
+### Wine + DXVK for one game
+
+- **CPU.** The PS4 CPU is x86-64, so the game's code runs directly on the PC's CPU, with no
+  emulation and no instruction translation.
+- **System libraries.** As Wine replaces the Windows API, the bbport runtime (`src/runtime_*.c`)
+  implements exactly the PS4 OS functions Bloodborne calls: memory, threads, files, audio, pad,
+  saves.
+- **Memory.** In the new mode, as in a PC game: the game's data in system RAM, VRAM used the way
+  a PC game uses it. The mode is still experimental.
+- **Graphics.** The PS4 GPU's command stream (PM4) is a recording of the game's graphics API
+  calls: it is written by 99 functions of the statically linked libGnm, so decoding the stream
+  and translating the calls themselves come to the same thing. GCN shaders are translated to
+  SPIR-V. In the new mode the command processor's work (memory writes, DMA, fences) is
+  translated into Vulkan commands as well; fences are written by the GPU itself. Resource
+  descriptors (textures, buffers) are read by the translator on the CPU, as DXVK reads resource
+  bindings: a PS4 texture has to be converted from the PS4 tiling into a Vulkan image before the
+  draw runs, so the CPU must know its descriptor beforehand — translation, not emulation. The
+  descriptor tables (the constant engine's dumps) are read only by the translator, so the CPU
+  performs them. The game's occlusion queries (~60 a frame) are
+  Vulkan occlusion queries; predication, `COPY_DATA` and `COND_EXEC` are translated too (check:
+  `BB_PM4_SELFTEST=1`). Details:
+  [docs/EMULATION_REMOVAL_PLAN.ru.md](docs/EMULATION_REMOVAL_PLAN.ru.md), "Шаг 4" (Russian).
+
+"Port" here means a build for this one game, not a rewrite of its source code, which the project
+neither has nor includes.
+
 ## Requirements
 
 - Windows 10 (1903 or later) or Windows 11, 64-bit

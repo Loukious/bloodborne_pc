@@ -1,5 +1,5 @@
-/* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
- * by the window thread (gpu/shim/window.cpp); here state is only sampled.
+/* libScePad on SDL3 gamepads and the keyboard. SDL events are pumped by the window thread
+ * (gpu/shim/window.cpp); here state is only sampled.
  *
  * Bindings (keyboard, controller and mouse) come from input.ini, parsed by
  * runtime_input_config.c; see specs/keyboard-and-mouse/spec-design-keyboard-mouse-input.md.
@@ -10,7 +10,27 @@
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, V Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, Q/C R3,
  *   Enter Options, Tab left touchpad, Backspace right touchpad,
- *   IJKL d-pad (I up, K down, J left, L right). */
+ *   IJKL d-pad (I up, K down, J left, L right).
+ *   Mouse (once the game window is clicked; F1 or leaving the window releases it): look (the
+ *   right stick), Left R1, Right L2, Middle R3, side buttons R2 (X1) and L1 (X2), wheel the
+ *   d-pad's up/down (quick items).
+ *
+ * Stick neutral: SDL exposes no way to read a pad's calibration and some clones report a
+ * biased neutral (a Switch-style pad was seen returning both sticks at a constant ~ +/-16380).
+ * The neutral of each axis is taken from a quiet window after the pad opens (SDL returns zero
+ * until the first report arrives, so those samples are skipped) and subtracted when all four axes
+ * are biased; otherwise (a genuine pad, perhaps opened with a stick held) the neutral is 0.
+ *
+ * Travel: such a clone also uses only part of SDL's -32768..32767 span (its neutral sits in the
+ * middle of one half), so reading the axis as -128..127 would reach only half deflection and a
+ * full push would never run. Each axis is instead scaled by its own travel: a biased axis starts
+ * from its neutral's magnitude and is refined by the largest push seen per direction, so both
+ * directions reach full deflection even when the two travels differ by a few percent (that
+ * difference is what makes one direction run and the other only walk). A genuine pad keeps the
+ * plain -32768..32767 -> -128..127 read. The stick is then converted as shadPS4 does, with an
+ * inner/outer dead zone (BB_PAD_DEADZONE, default 5; BB_PAD_DEADZONE_OUTER, default 127) mapping
+ * the axis' travel up to full deflection. BB_PAD_CENTER=lx,ly,rx,ry overrides the neutral,
+ * BB_PAD_CENTER_CAL=0 disables the measurement. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -70,8 +90,122 @@ static uint8_t connected_count;
 static uint64_t last_mouse_sample_us; /* CNV-003: dt since the previous mouse-to-stick sample */
 static double smoothed_mouse_stick_x, smoothed_mouse_stick_y; /* mouse_to_axis's EMA state */
 
+/* Per-controller stick neutral (see the file header): the value each axis holds while the
+ * sticks are untouched, taken from a quiet window after the pad opens. Works for any pad; a
+ * genuine one settles at 0 and the subtraction is a no-op. */
+#define PAD_CAL_QUIET 512              /* an axis is quiet when it moved no more than this */
+#define PAD_CAL_QUIET_SAMPLES 8
+#define PAD_CAL_TIMEOUT_US 3000000u    /* after this, an all-zero reading is accepted as the neutral */
+#define PAD_CAL_BIAS 8192              /* |neutral| past this: a biased neutral and a reduced travel */
+#define PAD_CAL_REFINE 90              /* % of the base travel a push must reach to count as the full scale */
+static int cal_enabled=-1, pad_deadzone=-1, pad_deadzone_outer=-1, cal_manual;
+static int cal_have_center, cal_started, cal_quiet_count;
+static int cal_center[4], cal_prev[4], cal_manual_center[4];
+static int cal_base[4];                /* 0: normal pad; else |neutral| of a biased axis */
+static int cal_max[4][2];              /* largest push seen per direction on a biased axis */
+static uint64_t cal_since;
+
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+static void cal_load(void) {
+    static int loaded;
+    if (loaded) return;
+    loaded=1;
+    const char *v=getenv("BB_PAD_CENTER_CAL"); cal_enabled=!(v && *v=='0');
+    /* Inner/outer dead zone, as shadPS4's analog_deadzone: [inner, outer] maps linearly to the
+     * full deflection, so an axis with a reduced travel (outer below 127) reaches full. */
+    v=getenv("BB_PAD_DEADZONE"); pad_deadzone=v && *v ? atoi(v) : 5;
+    if (pad_deadzone<0) pad_deadzone=0; else if (pad_deadzone>126) pad_deadzone=126;
+    v=getenv("BB_PAD_DEADZONE_OUTER"); pad_deadzone_outer=v && *v ? atoi(v) : 127;
+    if (pad_deadzone_outer<=pad_deadzone) pad_deadzone_outer=pad_deadzone<127 ? pad_deadzone+1 : 127;
+    v=getenv("BB_PAD_CENTER");
+    if (v && *v && sscanf(v,"%d,%d,%d,%d",&cal_manual_center[0],&cal_manual_center[1],
+                          &cal_manual_center[2],&cal_manual_center[3])==4) {
+        cal_manual=1;
+        printf("Runtime: pad center (BB_PAD_CENTER): lx=%d ly=%d rx=%d ry=%d\n",
+               cal_manual_center[0],cal_manual_center[1],cal_manual_center[2],cal_manual_center[3]);
+    }
+}
+static void cal_set_base(void) {
+    int biased=0;
+    for (int i=0;i<4;++i) {
+        const int a=abs(cal_center[i]);
+        cal_base[i]=a>=PAD_CAL_BIAS ? a : 0;   /* a biased axis spans one half of the int16 range */
+        cal_max[i][0]=cal_max[i][1]=0;
+        biased|=cal_base[i]!=0;
+    }
+    if (biased)
+        printf("Runtime: pad travel (biased neutral, per-axis scaling): lx=%d ly=%d rx=%d ry=%d\n",
+               cal_base[0]?cal_base[0]:32768,cal_base[1]?cal_base[1]:32768,
+               cal_base[2]?cal_base[2]:32768,cal_base[3]?cal_base[3]:32768);
+}
+/* Full-scale travel of one direction. A biased axis starts from its neutral's magnitude and is
+ * refined by the largest push seen (once that push is close to the base travel), so a direction
+ * whose physical travel is a few percent shorter still reaches full deflection. */
+static int cal_travel(int axis,int dir) {
+    const int base=cal_base[axis] ? cal_base[axis] : 32768;
+    return cal_base[axis] && cal_max[axis][dir]*100>=base*PAD_CAL_REFINE ? cal_max[axis][dir] : base;
+}
+static void cal_reset(void) {
+    cal_load();
+    cal_started=0; cal_quiet_count=0; cal_since=0; memset(cal_prev,0,sizeof cal_prev);
+    if (cal_manual) { memcpy(cal_center,cal_manual_center,sizeof cal_center); cal_have_center=1; }
+    else if (!cal_enabled) { memset(cal_center,0,sizeof cal_center); cal_have_center=1; }
+    else { cal_have_center=0; memset(cal_center,0,sizeof cal_center); memset(cal_base,0,sizeof cal_base); }
+    if (cal_have_center) cal_set_base();
+}
+/* The value each axis holds while the sticks are untouched (SDL's pre-report zeros are skipped);
+ * once it is known, the largest push seen per direction on a biased axis (see cal_travel). */
+static void cal_sample(const int16_t raw[4]) {
+    if (cal_have_center) {
+        for (int i=0;i<4;++i) {
+            if (!cal_base[i]) continue;
+            const int d=raw[i]-cal_center[i], dir=d>=0, travel=dir ? d : -d;
+            if (travel>cal_max[i][dir]) cal_max[i][dir]=travel;
+        }
+        return;
+    }
+    int allzero=1; for (int i=0;i<4;++i) if (raw[i]) allzero=0;
+    int quiet=1; for (int i=0;i<4;++i) if (cal_started && abs(raw[i]-cal_prev[i])>PAD_CAL_QUIET) quiet=0;
+    const uint64_t now=now_us();
+    if (!cal_started) { cal_started=1; cal_since=now; }
+    if (allzero && now-cal_since<PAD_CAL_TIMEOUT_US) quiet=0;
+    if (quiet) {
+        if (++cal_quiet_count>=PAD_CAL_QUIET_SAMPLES) {
+            /* Only the clone pattern (all four axes biased) is taken as the neutral: a genuine pad
+             * opened with a stick held steady would otherwise keep that push as its neutral. */
+            int biased=0;
+            for (int i=0;i<4;++i) biased+=abs(raw[i])>=PAD_CAL_BIAS;
+            for (int i=0;i<4;++i) cal_center[i]=biased==4 ? raw[i] : 0;
+            cal_have_center=1;
+            if (biased==4)
+                printf("Runtime: pad neutral: lx=%d ly=%d rx=%d ry=%d\n",cal_center[0],cal_center[1],cal_center[2],cal_center[3]);
+            else if (biased)
+                printf("Runtime: pad neutral 0 (%d of 4 axes off-center at open: a stick held, not a biased pad)\n",biased);
+            cal_set_base();
+        }
+    } else cal_quiet_count=0;
+    for (int i=0;i<4;++i) cal_prev[i]=raw[i];
+}
+/* One stick axis in the PS4 0..255 scale. The neutral is subtracted and the axis' own travel
+ * (cal_travel) is read as -128..127, so a full push reaches full deflection in both directions
+ * whatever part of SDL's range the pad uses; the inner/outer dead zone (BB_PAD_DEADZONE /
+ * BB_PAD_DEADZONE_OUTER) then maps that travel to the full deflection, as shadPS4 does. */
+static uint8_t stick_axis(int axis,int16_t raw) {
+    const int d=raw-cal_center[axis];
+    const int travel=cal_travel(axis,d>=0 ? 1 : 0);
+    int v=travel>0 ? (int)((long long)d*128/travel) : 0;
+    if (v>127) v=127; else if (v<-128) v=-128;
+    const int mag=abs(v);
+    if (mag<=pad_deadzone || pad_deadzone>=pad_deadzone_outer) v=0;
+    else {
+        int scaled=(int)(128.0*(mag-pad_deadzone)/(float)(pad_deadzone_outer-pad_deadzone));
+        if (scaled>128) scaled=128;
+        v = v>=0 ? scaled : -scaled;
+    }
+    int x=v+128;
+    return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x);
+}
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
@@ -81,17 +215,44 @@ static void touch_click(PadData *d, int right) {
     d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
 }
 
-/* Opens the first gamepad SDL knows about; called under lock. */
+/* BB_GAMEPAD (the launcher's controller choice): its SDL GUID, or part of its name. Issue #15:
+ * wheels and other controllers connected for good came first. */
+static const char *preferred_gamepad(void) {
+    static const char *want; static int read;
+    if (!read) { want=getenv("BB_GAMEPAD"); if (want && !*want) want=NULL; read=1; }
+    return want;
+}
+static int is_preferred(SDL_JoystickID id, const char *want) {
+    char guid[33];
+    SDL_GUIDToString(SDL_GetGamepadGUIDForID(id),guid,sizeof guid);
+    const char *name=SDL_GetGamepadNameForID(id);
+    return !strcasecmp(guid,want) || (name && strcasestr(name,want));
+}
+/* The chosen gamepad, else the first while it is not connected (checked again every second, it
+ * is taken as soon as it connects); called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
+    static int on_preferred; static uint64_t last_scan;
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
     if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
-    if (!gamepad) {
-        int count=0;
+    const char *want=preferred_gamepad();
+    const uint64_t now=now_us();
+    if (!gamepad || (want && !on_preferred && now-last_scan>1000000)) {
+        last_scan=now;
+        int count=0, pick=-1;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
-        if (ids && count>0) {
-            gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+        for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want)) pick=i;
+        if (pick<0 && !gamepad && ids && count>0) pick=0;
+        if (pick>=0 && (!gamepad || SDL_GetGamepadID(gamepad)!=ids[pick])) {
+            if (gamepad) SDL_CloseGamepad(gamepad);
+            gamepad=SDL_OpenGamepad(ids[pick]);
+            cal_reset(); /* a new pad has its own neutral */
+            on_preferred=want && gamepad && is_preferred(ids[pick],want);
+            if (gamepad) {
+                ++connected_count;
+                printf("Runtime: gamepad connected: %s%s\n",SDL_GetGamepadName(gamepad),
+                       !want ? "" : on_preferred ? " (the chosen one)" : " (the chosen one is not connected)");
+            }
         }
         SDL_free(ids);
     }
@@ -455,6 +616,7 @@ static const InputConfig *active_config(void) {
 }
 
 static void sample_host(PadData *d) {
+    report_guest_heap();
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
     d->orientation[3]=1.0f;

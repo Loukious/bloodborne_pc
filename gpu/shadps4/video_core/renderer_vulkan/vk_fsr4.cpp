@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "bbport_toggles.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -238,8 +239,10 @@ struct Fsr4Upscaler::Impl {
         }
         if (!fsr411) {
             const char* env = std::getenv("BB_FSR411_DIR");
+            const Fsr411::Features features{.fp8_matrices = instance.IsFsr411Fp8Supported(),
+                                            .fp16_matrices = instance.IsFsr411MatrixSupported()};
             fsr411 = std::make_unique<Fsr411::Upscaler>(instance.GetPhysicalDevice(), instance.GetDevice(),
-                                                        env && env[0] ? env : "fsr4_411");
+                                                        env && env[0] ? env : "fsr4_411", features);
         }
         // Its constant ring holds kFramesInFlight frames: the oldest must be done.
         while (fsr411_ticks.size() >= Fsr411::kFramesInFlight) {
@@ -257,6 +260,7 @@ struct Fsr4Upscaler::Impl {
         g.ultra_performance = f.preset >= 4;
         g.jitter[0] = f.jitter[0];
         g.jitter[1] = f.jitter[1];
+        g.motion_scale[1] = BbToggle::Disabled(BbToggle::Fsr4MotionYFlip) ? -1.0f : 1.0f;
         g.sharpness = f.sharpness;
         g.sharpen = f.sharpen && f.sharpness > 0.0f;
         g.reset = f.reset;
@@ -353,7 +357,8 @@ struct Fsr4Upscaler::Impl {
                             FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         d.jitterOffset = {f.jitter[0], f.jitter[1]};
         // Vectors are in render pixels; the provider divides by the render size.
-        d.motionVectorScale = {1.0f, 1.0f};
+        d.motionVectorScale = {1.0f,
+                               BbToggle::Disabled(BbToggle::Fsr4MotionYFlip) ? -1.0f : 1.0f};
         d.renderSize = {f.render_width, f.render_height};
         d.upscaleSize = {f.output.width, f.output.height};
         d.enableSharpening = f.sharpen && f.sharpness > 0.0f;

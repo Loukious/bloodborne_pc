@@ -179,7 +179,43 @@ static int translate(const char *guest,char *out,size_t size) {
         }
     }
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
+    /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
+    if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
     return result;
+}
+/* The PS4's file system ignores case, and the game asks for lower-case names
+ * (adhoc/font/dbgfont14h.ccm): files from mods or dumps made elsewhere keep their own case.
+ * After a miss, the host path is matched component by component ignoring case; true when it was
+ * corrected (same length: only case differs). Only on misses: no cost for found files. */
+static int fix_case(char *path) {
+    if (path[0]!='/') return 0;
+    char out[1024]="", trial[1024], part[256];
+    const char *p=path;
+    while (*p) {
+        while (*p=='/') ++p;
+        if (!*p) break;
+        const char *end=strchr(p,'/');
+        size_t len=end ? (size_t)(end-p) : strlen(p);
+        if (len>=sizeof(part)) return 0;
+        memcpy(part,p,len); part[len]=0;
+        if ((size_t)snprintf(trial,sizeof(trial),"%s/%s",out,part)>=sizeof(trial)) return 0;
+        if (access(trial,F_OK)) {
+            DIR *d=opendir(out[0] ? out : "/");
+            if (!d) return 0;
+            int found=0;
+            for (struct dirent *e;(e=readdir(d));)
+                if (!strcasecmp(e->d_name,part)) { snprintf(trial,sizeof(trial),"%s/%s",out,e->d_name); found=1; break; }
+            closedir(d);
+            if (!found) return 0;
+        }
+        memcpy(out,trial,strlen(trial)+1);
+        p+=len;
+    }
+    if (!strcmp(out,path) || strlen(out)!=strlen(path)) return 0;
+    memcpy(path,out,strlen(out)+1);
+    return 1;
 }
 static int host_flags(int flags) {
     int r;
@@ -204,6 +240,7 @@ static Listing *list_directory(const char *path) {
     size_t capacity=0,bytes=0,cap_names=0;
     struct dirent *e;
     while (l && (e=readdir(d))) {
+        if (temp_name(e->d_name)) continue;
         size_t n=strlen(e->d_name)+1;
         if (l->count==capacity) {
             capacity=capacity ? capacity*2 : 64;
@@ -260,6 +297,8 @@ static File *get(int fd) {
 }
 /* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
 static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
+/* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
+static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
@@ -452,6 +491,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
                 printf("Mods: open %s -> %s\n",guest,actual);
         }
     }
+    if (save_trace() && save_path(guest)) printf("Save trace: open(%s) -> fd %d\n",guest,fd);
     return fd;
 }
 static int64_t do_close(int fd) {
@@ -503,23 +543,47 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* A page protected again between the touch and the kernel's copy (the GPU side re-arms its write
+ * traps): EFAULT with nothing read. Touched again, the read is tried again a few times. */
+static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int positional) {
+    ssize_t n=-1;
+    for (int attempt=0; attempt<8; ++attempt) {
+        n=positional ? pread(h,buffer,size,offset) : read(h,buffer,size);
+        if (n>=0 || errno!=EFAULT) break;
+        touch_for_write(buffer,size);
+    }
+    return n;
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=host_read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+    if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
+    ssize_t n=read_retrying(h,buffer,size,offset,1);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
+}
+/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
+ * 16 up) would make the kernel's copy fail with EFAULT: a user-mode read of each page first goes
+ * through the handler, which copies the data back. */
+static void touch_for_read(const void *buffer,uint64_t size) {
+    if (!size) return;
+    uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
+    for (; p<end; p+=4096)
+        (void)*(volatile const unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
 }
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
@@ -532,10 +596,12 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    touch_for_read(buffer,size);
     ssize_t n=pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
+    if (save_trace()) { File *t=get(fd); if (t && save_path(t->path)) printf("Save trace: lseek(fd %d, %lld, %d)\n",fd,(long long)offset,whence); }
     File *f=get(fd);
     if (!f) return -EBADF;
     if (whence<0 || whence>2) return -EINVAL;
@@ -548,6 +614,7 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
     return r<0 ? -errno : r;
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
+    if (save_trace()) { File *t=get(fd); if (t && save_path(t->path)) printf("Save trace: fstat(fd %d)\n",fd); }
     int h=host_fd(fd);
     HostStat s;
 #ifdef _WIN32
@@ -609,7 +676,9 @@ static int64_t path_op(const char *guest,int op,int mode) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
-    return r ? -errno : 0;
+    r=r ? -errno : 0;
+    if (save_trace() && save_path(guest)) printf("Save trace: %s(%s) -> %d\n",op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r);
+    return r;
 }
 static int64_t do_rename(const char *from,const char *to) {
     if (game_path(from) || game_path(to)) return -EROFS;
