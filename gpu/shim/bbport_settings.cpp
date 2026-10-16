@@ -29,7 +29,9 @@ float Clamp(float v, float lo, float hi) {
 void Set(Values& v, const std::string& key, const std::string& value) {
     const float f = float(std::atof(value.c_str()));
     const int i = std::atoi(value.c_str());
-    if (key == "menu_language") {
+    if (key == "menu_pos") {
+        std::sscanf(value.c_str(), "%f,%f", &v.menu_x, &v.menu_y);
+    } else if (key == "menu_language") {
         if (value == "en") v.menu_language = MenuLanguage::English;
         else if (value == "ru") v.menu_language = MenuLanguage::Russian;
         else std::printf("Settings: unknown menu_language '%s' (expected en or ru)\n", value.c_str());
@@ -61,13 +63,11 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
-    } else if (key == "menu_pos") {
-        float x = -1.0f, y = -1.0f;
-        if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= 0.0f && x <= 1.0f && y >= 0.0f &&
-            y <= 1.0f) {
-            v.menu_x = x;
-            v.menu_y = y;
-        }
+    } else if (key == "mute_unfocused") {
+        v.mute_unfocused = i != 0;
+    } else if (key == "button_prompts") {
+        v.button_prompts = value == "playstation" ? PromptsPlayStation
+                         : value == "keyboard" ? PromptsKeyboard : PromptsAuto;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -78,6 +78,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "hud_position") {
         v.hud_position = std::clamp(i, 0, 100);
+    } else if (key == "fov") {
+        v.fov = std::clamp(i, FovMin, FovMax);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
@@ -166,6 +168,7 @@ void Load() {
     v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
     v.startup_hud_position = v.hud_position;
+    v.startup_fov = v.fov;
     v.startup_live_resolution = v.live_resolution;
 }
 
@@ -252,8 +255,11 @@ void Save() {
     }
     put("model_lod", std::to_string(v.model_lod.load()));
     put("output_res", std::to_string(OutputWidths[v.output_res]) + "x" + std::to_string(OutputHeights[v.output_res]));
-    // Read by run.py at start (hud_layout.py).
+    put("mute_unfocused", flag(v.mute_unfocused));
+    static constexpr const char* prompts[PromptsCount] = {"auto", "playstation", "keyboard"};
+    put("button_prompts", prompts[std::clamp(v.button_prompts.load(), 0, PromptsCount - 1)]);
     put("hud_position", std::to_string(v.hud_position.load()));
+    put("fov", std::to_string(v.fov.load()));
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
     if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {
