@@ -1,4 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// These Linux signal detours are only used by the dma-buf memory model.
+#include "bbport_guest_hooks.h"
+#include <cstdio>
+namespace BbGuestHooks {
+void Install(RangeCallback) {
+    std::printf("Guest memory hooks: unavailable with the Windows memory model\n");
+}
+} // namespace BbGuestHooks
+#else
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
@@ -418,3 +429,5 @@ void Install(RangeCallback on_gpu_range_allocated) {
     }
 }
 } // namespace BbGuestHooks
+
+#endif

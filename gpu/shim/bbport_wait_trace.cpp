@@ -10,8 +10,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <dlfcn.h>
-#include <execinfo.h>
+#include "bbport_host_diagnostics.h"
 #include <pthread.h>
 
 namespace BbWaitTrace {
@@ -85,7 +84,11 @@ Scope::~Scope() {
     for (int i = 0; i < Kept && Skip + i < depth; ++i) {
         key.frames[i] = frames[Skip + i];
     }
+#ifdef _WIN32
+    std::snprintf(key.thread.data(), key.thread.size(), "thread-%lu", GetCurrentThreadId());
+#else
     pthread_getname_np(pthread_self(), key.thread.data(), key.thread.size());
+#endif
     std::scoped_lock lk{mutex};
     auto& total = totals[key];
     total.ns += ns;

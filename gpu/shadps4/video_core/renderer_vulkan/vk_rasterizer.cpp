@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <dlfcn.h>
+#include "bbport_host_diagnostics.h"
 #include <map>
 #include <unordered_set>
 #include <xxhash.h>

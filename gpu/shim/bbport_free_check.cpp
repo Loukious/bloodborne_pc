@@ -1,4 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// Optional Linux SIGTRAP heap diagnostics; normal memory tracking remains active.
+#include "bbport_free_check.h"
+#include <cstdio>
+#include <cstdlib>
+namespace BbFreeCheck {
+bool Enabled() {
+    static const bool reported = [] {
+        const char* value = std::getenv("BB_FREE_CHECK");
+        if (value && value[0] == '1') {
+            std::fprintf(stderr, "BB_FREE_CHECK: Linux SIGTRAP diagnostics are unavailable on Windows\n");
+        }
+        return false;
+    }();
+    return reported;
+}
+void Check(std::uint64_t, std::uint64_t, const void*, Source, std::uint64_t) {}
+std::uint64_t NextFenceSeq() { return 0; }
+void NoteFenceDecoded(std::uint64_t, std::uint64_t, const void*, const void*, std::uint64_t) {}
+void NoteFenceWriting(std::uint64_t) {}
+void NoteFenceWritten(std::uint64_t, std::uint64_t) {}
+bool OnTrapFault(void*, std::uint64_t) { return false; }
+bool OnStaleTrapFault(std::uint64_t) { return false; }
+void NoteSubmit(std::uint64_t, const void*, std::uint64_t) {}
+void DumpAtFault(std::uint64_t, std::uint64_t) {}
+} // namespace BbFreeCheck
+#else
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_free_check.h"
 
 #include <algorithm>
@@ -1088,3 +1116,5 @@ bool OnStaleTrapFault(u64 address) {
     return true;
 }
 } // namespace BbFreeCheck
+
+#endif

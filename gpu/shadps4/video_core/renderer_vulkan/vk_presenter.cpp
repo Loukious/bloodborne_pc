@@ -358,12 +358,10 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
-    // bbport: BB_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
-    // guest display buffer and presented image are written to BB_DUMP_DIR (default out/dump)
-    // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
-    static const char* frame_dump_trigger = std::getenv("BB_FRAME_DUMP_TRIGGER");
-    static int frame_dump_index = 0;
-    const bool frame_dump = frame_dump_trigger && std::remove(frame_dump_trigger) == 0;
+    BbTimeline::Note(BbTimeline::PipeTask, 4, draw_scheduler.CurrentTick());
+    static const char* dump_trigger = std::getenv("BB_FRAME_DUMP_TRIGGER");
+    static int dump_index = 0;
+    const bool frame_dump = dump_trigger && std::remove(dump_trigger) == 0;
     // bbport: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
     const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
@@ -388,6 +386,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // for them to record everything handed over before (~90 us a frame of the draw recording
     // thread) and then submit from this thread.
     draw_scheduler.EndRendering();
+    // Explicit diagnostic frames record synchronously so readback retirement keeps this tick.
+    if (frame_dump) {
+        draw_scheduler.CommandBuffer();
+    }
 
     VideoCore::ImageViewInfo view_info{};
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
@@ -427,9 +429,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
                             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
             runtime.FlushBarriers();
-            DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
+            DumpRaw(instance, draw_scheduler, draw_scheduler.CommandBuffer(), image.GetImage(),
                     vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
-                    image.info.size.height, "display", frame_dump_index);
+                    image.info.size.height, "display", dump_index);
         }
         image_view = *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
@@ -452,17 +454,57 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+
+    // Numbered here, in command order; marked where the commands are recorded.
+    const u32 stream = draw_scheduler.CrumbStream();
+    const bool crumbs = Breadcrumbs::Enabled();
+    const u32 fsr_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter FSR"}) : 0;
+    const u32 pp_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter post process"}) : 0;
+    draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
+                           fsr_crumb, pp_crumb, fsr = fsr_settings,
+                           pp = pp_settings](vk::CommandBuffer cmdbuf) {
+        // Frames of different submissions may be recorded on two threads at once.
+        std::scoped_lock lock{passes_mutex};
+        const auto pre_barrier = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->image,
+            .subresourceRange{frame_subresources},
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &pre_barrier,
+        });
+        if (fsr_crumb) {
+            Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, false);
+        }
+        const vk::ImageView input = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                                    {frame->width, frame->height}, fsr,
+                                                    frame->is_hdr);
+        if (fsr_crumb) {
+            Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, true);
+            Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, false);
+        }
+        pp_pass.Render(cmdbuf, input, image_size, *frame, pp);
+        if (pp_crumb) {
+            Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
+        }
+    });
     if (frame_dump) {
-        // The presented image as the swapchain blit reads it (General after the pass).
-        const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                                      .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                                      .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                      .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+        const auto cmdbuf = draw_scheduler.CommandBuffer();
+        const vk::MemoryBarrier2 done{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
         cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
         DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
-                frame->width, frame->height, "output", frame_dump_index);
-        ++frame_dump_index;
+                frame->width, frame->height, "output", dump_index++);
     }
 
     // Flush frame creation commands.

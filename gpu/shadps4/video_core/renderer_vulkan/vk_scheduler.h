@@ -708,10 +708,17 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
-    /// bbport: waits for the work submitted so far but leaves the command buffer being
-    /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
-    /// recording into a submitted buffer crashes AMD's driver).
-    void WaitSubmitted();
+    /// bbport: waits for the GPU to complete the submissions before the current one, which is
+    /// not sent: for callers that keep recording into it (the upscaler between CommandBuffer()
+    /// and the end of its pass) and free resources only earlier submissions used.
+    void WaitSubmitted() { WaitSubmittedWork(); }
+
+    void WaitSubmittedWork() {
+        const u64 tick = CurrentTick();
+        if (tick > 1) {
+            Wait(tick - 1);
+        }
+    }
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
@@ -748,9 +755,9 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
-        if (recording_threaded && !direct_mode) {
-            SyncRecording();
-            direct_mode = true;
+        ProducerScope producer{*this, "CommandBuffer"};
+        if (!workers.empty() && !direct_mode) {
+            EnterDirectMode();
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
             TraceDirectRecording(__builtin_return_address(0));
         }
@@ -800,7 +807,8 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
-        if (!recording_threaded || direct_mode) {
+        ProducerScope producer{*this, "Record"};
+        if (workers.empty() || direct_mode) {
             func(current_cmdbuf);
             return;
         }
@@ -809,24 +817,49 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (!record_chunk->Push(std::forward<Func>(func))) {
+        if (!CurrentChunk().Push(std::forward<Func>(func))) {
             RetireChunk();
-            const bool pushed = record_chunk->Push(std::forward<Func>(func));
+            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
     }
 
-    /// bbport: replaces the current chunk with a fresh one. The replacement is taken first, so
-    /// `record_chunk` is never null: code that re-enters the recording side (a guest memory
-    /// fault handled inline on this thread) used to find it null between the two steps.
-    void RetireChunk() {
-        auto next = AcquireChunk();
-        full_chunks.push_back(std::exchange(record_chunk, std::move(next)));
+    /// bbport: Record() for a draw, dispatch or pass that runs shaders, between GPU breadcrumbs
+    /// (vk_breadcrumbs.h): on a GPU hang they say which one never finished.
+    template <typename Func>
+    void RecordCrumb(const Breadcrumbs::Crumb& crumb, Func&& func) {
+        if (!Breadcrumbs::Enabled()) {
+            Record(std::forward<Func>(func));
+            return;
+        }
+        const u32 id = Breadcrumbs::Note(crumb_stream, crumb);
+        Record([func = std::forward<Func>(func), stream = crumb_stream,
+                id](vk::CommandBuffer cmdbuf) mutable {
+            Breadcrumbs::Mark(cmdbuf, stream, id, false);
+            func(cmdbuf);
+            Breadcrumbs::Mark(cmdbuf, stream, id, true);
+        });
+    }
+
+    /// bbport: waits until the submission signalling `tick` is in the queue. Another thread's
+    /// submission waiting for the tick on the same queue must not go first (BB_ASYNC_SUBMIT
+    /// submits from the recording threads): the queue would wait for a later submission.
+    void WaitSubmitted(u64 tick) {
+        u64 submitted = submitted_tick.load(std::memory_order_acquire);
+        while (submitted < tick) {
+            submitted_tick.wait(submitted, std::memory_order_acquire);
+            submitted = submitted_tick.load(std::memory_order_acquire);
+        }
+    }
+
+    /// bbport: the breadcrumb stream of this scheduler, for passes recorded on CommandBuffer().
+    [[nodiscard]] u32 CrumbStream() const noexcept {
+        return crumb_stream;
     }
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
-        return recording_threaded && !direct_mode &&
+        return !workers.empty() && !direct_mode &&
                !BbToggle::Disabled(BbToggle::ThreadedRecording);
     }
 
@@ -837,7 +870,7 @@ public:
             return;
         }
         ASSERT(bytes + 1024 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
             RetireChunk();
         }
     }
@@ -1180,10 +1213,6 @@ private:
     std::atomic<const char*> producer_where{nullptr}; ///< and where
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
-    // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
-    // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
-    bool recording_threaded{false};
-    std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
 };
 

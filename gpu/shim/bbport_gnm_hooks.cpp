@@ -10,8 +10,7 @@
 #include <cstring>
 #include <thread>
 #include <vector>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "bbport_host_memory.h"
 
 namespace BbGnmHooks {
 namespace {
@@ -37,7 +36,7 @@ constexpr std::size_t CounterStride = 64; // one cache line per counter
 
 u8* stubs = nullptr;
 u64* CounterAt(std::size_t i) {
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = BbHostMemory::PageSize();
     const std::size_t code_bytes = ((Count + 1) * SlotSize + page - 1) / page * page;
     return reinterpret_cast<u64*>(stubs + code_bytes + i * CounterStride);
 }
@@ -47,9 +46,8 @@ u8* MapNear(unsigned char* image, std::uint64_t image_size, std::size_t size) {
     const u64 base = reinterpret_cast<u64>(image);
     for (u64 k = 1; k <= 64; ++k) {
         for (const u64 hint : {base - k * (16ull << 20), base + image_size + k * (16ull << 20)}) {
-            void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-            if (p != MAP_FAILED) {
+            void* p = BbHostMemory::MapAt(hint, size, BbHostMemory::Read | BbHostMemory::Write);
+            if (p) {
                 return static_cast<u8*>(p);
             }
         }
@@ -201,7 +199,7 @@ void Mark(std::uint32_t index, u64 before, u64 after, u64 cb = 0) {
     }
 }
 
-extern "C" void BbGnmEnter(std::uint32_t index, u64 cb, u64* slot) {
+extern "C" BB_GUEST_ABI void BbGnmEnter(std::uint32_t index, u64 cb, u64* slot) {
     __atomic_fetch_add(CounterAt(index), 1, __ATOMIC_RELAXED);
     if (depth == MaxDepth) {
         overflow.fetch_add(1, std::memory_order_relaxed);
@@ -218,7 +216,7 @@ extern "C" void BbGnmEnter(std::uint32_t index, u64 cb, u64* slot) {
     *slot = reinterpret_cast<u64>(exit_thunk);
 }
 
-extern "C" u64 BbGnmLeave() {
+extern "C" BB_GUEST_ABI u64 BbGnmLeave() {
     const Frame f = frames[--depth];
     const bool cb_method = Table[f.index].cb_method;
     if (f.index == trace_index && trace_left.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -517,7 +515,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         return;
     }
     const std::size_t stub_bytes = (Count + 1) * SlotSize; // + the shared exit thunk
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = BbHostMemory::PageSize();
     const std::size_t code_bytes = (stub_bytes + page - 1) / page * page;
     const std::size_t map_bytes = code_bytes + Count * CounterStride;
     image_base = reinterpret_cast<u64>(image);
@@ -588,7 +586,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         std::memset(fn + 5, 0xcc, e.prologue_size - 5);
         ++patched;
     }
-    mprotect(stubs, code_bytes, PROT_READ | PROT_EXEC);
+    BbHostMemory::Protect(stubs, code_bytes, BbHostMemory::Read | BbHostMemory::Execute);
     std::printf("Gnm census: %zu of %zu libGnm entry points hooked (%zu do not match the 1.09 eboot)%s\n",
                 patched, Count, mismatched, observe ? "; command buffer methods observed" : "");
     std::thread(ReportLoop).detach();

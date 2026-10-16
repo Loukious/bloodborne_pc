@@ -81,8 +81,19 @@ static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32
 static int pool_fd=-1;
 #endif
+#define CHUNK (UINT64_C(256) << 20)
+typedef int (*GuestChunkAlloc)(uint64_t phys, uint64_t size);
+static GuestChunkAlloc chunk_alloc;
+#ifndef _WIN32
+static int *chunk_fds; /* per CHUNK of direct memory: -1 not decided, -2 memfd, -3 memfd the GPU
+                        * imported (host memory: VK_EXT_external_memory_host), else a dma-buf fd */
+#endif
+#define CHUNK_IMPORTED (-3)
+/* Released memory in a chunk the GPU uses is cleared, not punched out: the GPU holds those pages. */
+#define GPU_CHUNK(fd) ((fd)>=0 || (fd)==CHUNK_IMPORTED)
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
 static int whole_chunks;
+#ifndef _WIN32
 typedef struct { uint64_t phys, size; int fd; } Region;
 #define MAX_REGIONS 256
 static Region regions[MAX_REGIONS];
@@ -108,6 +119,7 @@ static void add_region(uint64_t phys, uint64_t size) {
     regions[i]=(Region){phys,size,fd>=0 || fd==CHUNK_IMPORTED ? fd : -2};
     ++region_count;
 }
+#endif
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
 /* GPU hooks (bbgpu): notified outside the lock, in order, after each operation. */
@@ -462,7 +474,9 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
         if (!overlap) break;
     }
     blocks[slot] = (Block){start, size, type, 1}; *out = (int64_t)start;
+#ifndef _WIN32
     ensure_chunks(start,size);
+#endif
     ++allocations; live_bytes += size;
     write_unlock();
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
@@ -612,6 +626,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
     for (; i<vma_count && vmas[i].start<end; ++i) { vmas[i].prot=prot; if (type>=0) vmas[i].type=type; }
+    trap_reapply(start,end);
     queue_hook(HOOK_INVALIDATE,start,end-start);
     ++protects;
     return 0;
@@ -828,8 +843,13 @@ static _Atomic(uint64_t) *write_watch;
 static GpuRange hook_cpu_write;
 void runtime_memory_set_cpu_write_hook(GpuRange hook) {
     if (!write_watch) {
+#ifdef _WIN32
+        void *bits=VirtualAlloc(NULL,WATCH_LIMIT>>15,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        if (!bits) { fputs("bbport: cannot allocate write watch bitmap\n",stderr); return; }
+#else
         void *bits=mmap(NULL,WATCH_LIMIT>>15,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
         if (bits==MAP_FAILED) { perror("bbport: write watch bitmap"); return; }
+#endif
         write_watch=bits;
     }
     hook_cpu_write=hook;
@@ -877,7 +897,7 @@ static void trap_apply(uintptr_t a, uintptr_t b, int level) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         const uintptr_t s=vmas[i].start>a ? vmas[i].start : a, e=vmas[i].end<b ? vmas[i].end : b;
         const int prot=host_prot(vmas[i].prot);
-        mprotect((void *)s,e-s,level==2 ? PROT_NONE : level ? (prot & ~PROT_WRITE) : prot);
+        host_protect(s,e-s,level==2 ? PROT_NONE : level ? (prot & ~PROT_WRITE) : prot);
     }
 }
 /* No traps in [start, end) any more: a mapping replaced or gone (runtime lock held). */
@@ -906,11 +926,21 @@ static void trap_reapply(uintptr_t start, uintptr_t end) {
 void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on) {
     if (!size || address>=TRAP_LIMIT) return;
     if (!trap_reasons) {
+#ifdef _WIN32
+        void *bytes=VirtualAlloc(NULL,TRAP_LIMIT>>12,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        if (!bytes) { fputs("bbport: cannot allocate write trap table\n",stderr); return; }
+#else
         void *bytes=mmap(NULL,TRAP_LIMIT>>12,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
         if (bytes==MAP_FAILED) { perror("bbport: write trap table"); return; }
+#endif
         uint8_t *expected=NULL;
-        if (!__atomic_compare_exchange_n(&trap_reasons,&expected,(uint8_t *)bytes,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+        if (!__atomic_compare_exchange_n(&trap_reasons,&expected,(uint8_t *)bytes,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+#ifdef _WIN32
+            VirtualFree(bytes,0,MEM_RELEASE);
+#else
             munmap(bytes,TRAP_LIMIT>>12);
+#endif
+        }
     }
     uintptr_t end=address+size>TRAP_LIMIT ? TRAP_LIMIT : address+size;
     read_lock();

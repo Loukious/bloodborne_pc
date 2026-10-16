@@ -35,11 +35,15 @@
 #include <pthread.h>
 #include <x86intrin.h>
 #include <cstring>
+#ifndef _WIN32
 #include <dlfcn.h>
-#include <string>
-#include <fmt/format.h>
 #include <sys/mman.h>
 #include <ucontext.h>
+#else
+#include <windows.h>
+#endif
+#include <string>
+#include <fmt/format.h>
 #include "common/signal_context.h"
 #include "core/signals.h"
 #include <vk_mem_alloc.h>
@@ -569,6 +573,36 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         LOG_INFO(Render_Vulkan, "Buffer arenas of {} MiB (driver buffer limit {} MiB)",
                  arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);
     }
+    integrated_gpu = instance.IsIntegrated();
+    // bbport: the PC memory model needs the game's direct memory in dma-buf chunks the runtime can
+    // map at any offset (BbGuestMemory::Usable), and an AMD GPU for now (PcModelGpu). Without
+    // them it is off, as BB_GUEST_IN_PLACE=0.
+    if (GuestInPlace() &&
+        (!BbGuestMemory::PcModelGpu(instance) || !BbGuestMemory::Usable(instance))) {
+        DisableGuestInPlace();
+        std::printf("Guest memory: the PC memory model is off with this driver; the GPU uses copies "
+                    "in VRAM (as BB_GUEST_IN_PLACE=0)\n");
+    }
+    // Hooks in the game's own code, from its profile (games/). BB_GUEST_HOOKS=0: none, as for a
+    // game the port knows nothing about.
+    const char* hooks_env = std::getenv("BB_GUEST_HOOKS");
+    const Game::Profile* game = Game::Active();
+    if (GuestInPlace() && game && game->install_hooks && !(hooks_env && hooks_env[0] == '0')) {
+        static BufferCache* hooked_cache = this;
+        game->install_hooks(Game::CoreServices{
+            .fresh_range = [](u64 address, u64 size) { hooked_cache->NoteFreshRange(address, size); },
+        });
+    } else if (GuestInPlace() && game) {
+        std::printf("Guest hooks: off (BB_GUEST_HOOKS=0): nothing in the game's own code is hooked\n");
+    }
+    if (LayerMode()) {
+        BbLayer::GpuMemory::Get().SetTranslate(&LayerTranslate);
+        std::printf("Guest memory: the layer's memory module binds the game's memory in place "
+                    "(chunk buffers, no sparse arena for it; BB_LAYER_MEMORY=1)\n");
+    }
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetReadbackQueueFamilyIndex()};
+    const bool shared = bool(instance.GetReadbackQueue()); // as Buffer creates the arenas
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -589,14 +623,31 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = arena_page_size / block_size;
     blocks_per_arena_page_shift = arena_page_bits - block_shift;
+    BbLayer::GpuMemory::Get().SetBlockShift(static_cast<u32>(block_shift));
+    group_use.assign(u64{1} << (ADDRESS_SPACE_BITS - USE_GROUP_BITS), 0);
+    group_demoted.assign(group_use.size(), 0);
+    layer_group_use.assign(group_use.size(), 0);
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
     arena_memory_type_bits = reqs.memoryTypeBits;
 
+    {
+        const auto& properties = instance.GetMemoryProperties();
+        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+            const auto flags = properties.memoryTypes[i].propertyFlags;
+            if (((reqs.memoryTypeBits >> i) & 1) && !(flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+                (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+                arena_fallback_type_index = i;
+                break;
+            }
+        }
+    }
+
     const u64 bda_pagetable_size =
-        (blocks_per_arena_page * num_arena_pages) * sizeof(vk::DeviceAddress);
+        (blocks_per_arena_page * num_arena_pages) * sizeof(vk::DeviceAddress) *
+        (LayerActive() ? 2 : 1);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
                                                    blocks_per_arena_page * num_arena_pages);
     bda_pagetable_buffer = std::make_unique<Buffer>(
@@ -668,7 +719,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     BbStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     std::array<char, 16> requester{};
     if (Readbacks()) {
+#ifdef _WIN32
+        std::snprintf(requester.data(), requester.size(), "gpu-worker");
+#else
         pthread_getname_np(pthread_self(), requester.data(), requester.size());
+#endif
     }
     const auto flush_request = [this, device_addr, size, is_write, requester] {
         readback_requester = requester.data();
@@ -1449,30 +1504,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
     BbStats::Timer timer{BbStats::t_resident};
 
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    auto [alloc_result, device_memory] = instance.GetDevice().allocateMemory(alloc_info);
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // bbport: VRAM full. The guest memory the GPU uses is backed here and only grows as areas
-        // load; on 4-8 GB cards it ran out ("ErrorOutOfDeviceMemory" stopped the game). Another
-        // memory type the arena accepts, outside VRAM (system memory the GPU reaches), is slower
-        // but keeps the game going.
-        const auto& props = instance.GetMemoryProperties();
-        const u32 vram_heap = props.memoryTypes[arena_memory_type_index].heapIndex;
-        for (u32 i = 0; i < props.memoryTypeCount && alloc_result != vk::Result::eSuccess; ++i) {
-            if (((arena_memory_type_bits >> i) & 1) == 0 || props.memoryTypes[i].heapIndex == vram_heap) {
-                continue;
-            }
-            alloc_info.memoryTypeIndex = i;
-            std::tie(alloc_result, device_memory) = instance.GetDevice().allocateMemory(alloc_info);
+    // bbport BB_GUEST_IN_PLACE: blocks of the game's direct memory are bound to the memory it
+    // lives in; the rest (and everything without it) gets VRAM as before.
+    std::vector<ResidentBind> binds;
+    if (GuestInPlace()) {
+        IntervalList rest;
+        for (const auto& range : bind_ranges) {
+            BindInPlace(range.start, range.end, binds, rest, in_place);
         }
-        if (alloc_result == vk::Result::eSuccess) {
-            Vulkan::NoteOverBudget("buffer");
-        }
+        bind_ranges = std::move(rest);
     }
-    device_memory = Vulkan::Check(vk::ResultValue<vk::DeviceMemory>{alloc_result, device_memory});
+    u64 vram_blocks = 0;
+    for (const auto& range : bind_ranges) {
+        vram_blocks += range.end - range.start;
+    }
 
     if (vram_blocks != 0) {
         // bbport: the slots of blocks that left VRAM first, block by block. A request of several
@@ -2686,11 +2731,16 @@ bool VramTrapHandler(void* context, void* fault_address) {
             return false;
         }
     }
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
-    const u64 rip = u64(g[REG_RIP]);
+    const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
     constexpr u64 Image = 0x800000000ull, ImageEnd = 0x810000000ull;
     u64 caller = 0;
+#ifdef _WIN32
+    const auto* stack = reinterpret_cast<const u64*>(
+        static_cast<const EXCEPTION_POINTERS*>(context)->ContextRecord->Rsp);
+#else
+    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
     const auto* stack = reinterpret_cast<const u64*>(g[REG_RSP]);
+#endif
     for (u32 i = 0; i < 48; ++i) {
         if (stack[i] >= Image && stack[i] < ImageEnd) {
             caller = stack[i] - Image;
@@ -2724,7 +2774,8 @@ bool VramTrapHandler(void* context, void* fault_address) {
             trap.address = address;
         }
     }
-    mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_READ | PROT_WRITE);
+    BbLayer::WriteTraps::Set(block, vram_trap_block_size,
+                             BbLayer::WriteTraps::VramDiagnostic, false);
     return true;
 }
 
@@ -2732,12 +2783,25 @@ std::string VramTrapSiteName(u64 rip) {
     if (!(rip >> 63)) {
         return fmt::format("+{:#x}", rip);
     }
-    Dl_info info{};
     const u64 address = rip & ~(1ull << 63);
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mem{};
+    if (VirtualQuery(reinterpret_cast<void*>(address), &mem, sizeof(mem))) {
+        char name[MAX_PATH]{};
+        if (GetModuleFileNameA(static_cast<HMODULE>(mem.AllocationBase), name, MAX_PATH)) {
+            const char* basename = std::strrchr(name, '\\');
+            return fmt::format("host {}+{:#x}", basename ? basename + 1 : name,
+                               address - reinterpret_cast<u64>(mem.AllocationBase));
+        }
+    }
+    return fmt::format("host {:#x}", address);
+#else
+    Dl_info info{};
     dladdr(reinterpret_cast<void*>(address), &info);
     const char* name = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
     return fmt::format("host {}+{:#x}", name ? name + 1 : "?",
                        address - reinterpret_cast<u64>(info.dli_fbase));
+#endif
 }
 
 void ReportVramTraps() {
@@ -2752,7 +2816,8 @@ void ReportVramTraps() {
             }
         }
         for (const u64 block : blocks) {
-            mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_NONE);
+            BbLayer::WriteTraps::Set(block, vram_trap_block_size,
+                                     BbLayer::WriteTraps::VramDiagnostic, true);
         }
         static auto last = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - last < std::chrono::seconds(3)) {
@@ -2924,7 +2989,8 @@ void BufferCache::QueuePromotions(u64 submitted) {
             vram_trap_block_size = block_size;
             std::scoped_lock lk{vram_trapped_mutex};
             vram_trapped[address] = block_size;
-            mprotect(reinterpret_cast<void*>(address), block_size, PROT_NONE);
+            BbLayer::WriteTraps::Set(address, block_size,
+                                     BbLayer::WriteTraps::VramDiagnostic, true);
         }
     }
     if (moved == 0) {

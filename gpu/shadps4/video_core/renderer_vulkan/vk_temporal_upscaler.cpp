@@ -183,7 +183,7 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     {
         const Dlss* dlss = Dlss::Get();
         static std::string problem;
-        problem = !dlss ? "bbport_dlss.dll and nvngx_dlss.dll are not installed"
+        problem = !dlss ? "the DLSS bridge and NVIDIA's DLSS library are not installed"
                         : dlss->Problem();
         BbSettings::ConfigureDlssSupport(dlss && dlss->Available(), problem.c_str());
     }
@@ -252,8 +252,10 @@ bool TemporalUpscaler::Active() const {
 }
 
 bool TemporalUpscaler::ReactiveOn() const {
-    // FSR 4 takes no reactive mask: the opaque snapshot and the mask pass would be wasted.
-    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseFsr4() && !UseDlss() &&
+    // FSR 4 takes no reactive mask itself: the mask blends its output afterwards
+    // (RecordFsr4Reactive).
+    // DLSS takes no reactive mask.
+    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseDlss() &&
            BbSettings::Get().upscaler != BbSettings::UpscalerTaa;
 }
 
@@ -352,9 +354,7 @@ bool TemporalUpscaler::OnFrameStart() {
     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
     const int upscaler = settings.upscaler.load();
     const int output = settings.output_res.load();
-    // Ultrawide outputs apply after a restart (startup patch), not live.
-    const bool output_changed = !scaled_session && applied_output != output &&
-                                !BbSettings::Ultrawide(output);
+    const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
         target_width = BbSettings::OutputWidths[output];
         target_height = BbSettings::OutputHeights[output];
@@ -852,9 +852,13 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
     }
     const auto device = instance.GetDevice();
     if (extra_sharpen_width != w || extra_sharpen_height != h) {
-        // Retired command buffers may still read the old copy. `cmdbuf` stays open.
-        scheduler.WaitSubmitted();
-        extra_sharpen_view.reset();
+        // Submitted work may still read the old copy: destroyed once the GPU is past it. (A
+        // Finish() here submitted the command buffer Run() goes on recording into.)
+        scheduler.DeferOperation([image = std::move(extra_sharpen_image),
+                                  view = std::move(extra_sharpen_view)]() mutable {
+            view.reset();
+            image.Destroy();
+        });
         extra_sharpen_image = VideoCore::UniqueImage(device, instance.GetAllocator());
         extra_sharpen_image.Create(vk::ImageCreateInfo{
             .imageType = vk::ImageType::e2D,
@@ -1211,6 +1215,9 @@ void TemporalUpscaler::Run() {
     } else if (UseFsr4()) {
         dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h},
                                 {input_depth, input_depth_view, w, h}, w, h, ow, oh, frame_ms);
+        if (dispatched && has_reactive) {
+            RecordFsr4Reactive(cmdbuf, input_color_view, w, h, ow, oh);
+        }
     } else if (UseDlss()) {
         dispatched = RecordDlss(
             cmdbuf,
@@ -1448,12 +1455,11 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
     if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
-    // bbport: a UI draw without a color target (a Scaleform mask: color writes off) writes the
-    // stencil the next UI draws test, so it belongs in the UI's output-size depth like them. In
-    // the guest depth its mask was lost when the next UI draw switched depths (PrepareUiDepth
-    // clears the stencil): masked pictures, like the loading screen's item, vanished at outputs
-    // other than 1080p. Patch by bmy (deadinside28/bloodborne_pc issue #67), via parsifal295
-    // (PR #62).
+    // bbport (issue #67, patch by bmy): a UI draw without a color target (a Scaleform mask, color
+    // writes off) writes the stencil the UI's next draws test, so it must go into the UI's
+    // output-size depth like them. Left in the guest depth, the mask was lost when the next UI
+    // draw switched to the UI depth (PrepareUiDepth clears its stencil): masked images (the
+    // loading screen's item picture, cut out of a sheet) vanished.
     if (ui_phase && !color && depth && depth != ui_depth && ui_color) {
         const auto& depth_image = texture_cache.GetImage(depth);
         const auto& ui_target = texture_cache.GetImage(ui_color);
@@ -1663,43 +1669,13 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
     }
-    const auto cmd = scheduler.CommandBuffer();
-    vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
-        .image = vk::Image(ui_image),
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-    };
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    // Ultrawide: menus without a scene draw their backdrop over the 1920-wide stage only and
-    // leave the game's grey clear color beside it. Those columns are black instead. A frame
-    // with a scene (G-buffer depth this frame) fills the whole width: upscaler off, or a menu
-    // over the world.
-    const bool scene = !camera_motion.Enabled() || camera_motion.Depth();
-    const float side = scene ? 0.0f : 0.5f * (1.0f - 1920.0f / float(UiComposition::Canvas()[0]));
-    const s32 src_side = s32(std::lround(source_width * side));
-    const s32 dst_side = s32(std::lround(ui_width * side));
-    if (dst_side > 0) {
-        cmd.clearColorImage(vk::Image(ui_image), vk::ImageLayout::eTransferDstOptimal,
-                            vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 1.0f}},
-                            vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
-        const vk::MemoryBarrier2 cleared{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                                         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
-        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &cleared});
-    }
     const vk::ImageBlit region{
         .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{src_side, 0, 0},
-            vk::Offset3D{s32(source_width) - src_side, s32(source_height), 1}},
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+            vk::Offset3D{s32(source_width), s32(source_height), 1}},
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets = std::array{vk::Offset3D{dst_side, 0, 0},
-            vk::Offset3D{s32(ui_width) - dst_side, s32(ui_height), 1}},
+        .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+            vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
     };
     scheduler.Record([source, source_layout, ui = vk::Image(ui_image),
                       region](vk::CommandBuffer cmd) {
@@ -1827,6 +1803,7 @@ void TemporalUpscaler::RunScaled() {
 
     // bbport: FSR 4 writes its HDR-format output, copied into the output-size UI image.
     if (UseFsr4() || UseDlss() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
+        const auto cmdbuf = scheduler.CommandBuffer(); // after the commands recorded above
         barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
                 vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
                 vk::ImageLayout::eGeneral, all, rw);
@@ -1834,6 +1811,7 @@ void TemporalUpscaler::RunScaled() {
         if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
             RecordTaa(cmdbuf, color_view, depth_view);
         } else if (UseDlss()) {
+            fsr4_linear_frame = false;
             ok4 = RecordDlss(cmdbuf,
                              {color_image, color_view, color.info.pixel_format,
                               vk::ImageAspectFlagBits::eColor, source_width, source_height},
@@ -2315,7 +2293,7 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
     bool ok = true;
     if (!dlss->HasFeature(desc)) {
         // The previous feature may still be in use by submitted work; `cmdbuf` stays open.
-        scheduler.WaitSubmitted();
+        scheduler.WaitSubmittedWork();
         dlss->ReleaseFeature();
         ok = dlss->CreateFeature(cmdbuf, desc);
         reset = true;

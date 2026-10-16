@@ -22,6 +22,8 @@ enum Reason : unsigned {
     /// Reads too: the GPU wrote the page's newest data into a VRAM copy only; copied back into
     /// the game's memory on the first CPU access (BB_LAYER_READ_TRAPS).
     VramData = 32,
+    /// Optional BB_VRAM_ACCESS_TRAP diagnostics; distinct from the layer's VramData reason.
+    VramDiagnostic = 64,
 };
 /// Reasons that make a page no access, not only read-only.
 inline constexpr unsigned NoAccess = 0xf0;

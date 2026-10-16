@@ -2324,9 +2324,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
     }
 
-    if (copy && BbFreeCheck::Enabled()) {
-        CheckSubmittedCopy(*copy, seq); // diagnostic
-    }
+    // The legacy SubmittedCopy diagnostic from upstream is obsolete:
+    // the live command-buffer copy is now owned by BbCommandBufferCopy.
 
     FIBER_EXIT;
 }
@@ -2786,94 +2785,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 }
 
 
-void Liverpool::CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq) {
-    // The guest memory may be unmapped by now: read it without faulting.
-    static std::atomic<u64> changed{0}, checked{0};
-    const auto first_change = [](const u32* guest, const u32* kept, std::size_t dwords) -> s64 {
-        std::array<u32, 1024> buf;
-        for (std::size_t at = 0; at < dwords; at += buf.size()) {
-            const std::size_t n = std::min(buf.size(), dwords - at);
-            iovec local{buf.data(), n * 4}, remote{const_cast<u32*>(guest + at), n * 4};
-            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(n * 4)) {
-                // bbport BB_GUEST_IN_PLACE: dma-buf guest memory is not readable that way; still
-                // mapped, it is read directly.
-                int prot = 0, type = -1;
-                uintptr_t end = 0;
-                const auto from = reinterpret_cast<uintptr_t>(guest + at);
-                if (!runtime_memory_vma_info(from, &prot, &type, &end) || end < from + n * 4) {
-                    return -2 - s64(at); // unmapped
-                }
-                std::memcpy(buf.data(), guest + at, n * 4);
-            }
-            for (std::size_t i = 0; i < n; ++i) {
-                if (buf[i] != kept[at + i]) {
-                    return s64(at + i);
-                }
-            }
-        }
-        return -1;
-    };
-    checked.fetch_add(1, std::memory_order_relaxed);
-    const s64 dcb_change = first_change(copy.guest_dcb, copy.data.data(), copy.dcb_dwords);
-    const s64 ccb_change =
-        first_change(copy.guest_ccb, copy.data.data() + copy.dcb_dwords, copy.ccb_dwords);
-    if (dcb_change == -1 && ccb_change == -1) {
-        return;
-    }
-    const u64 n = changed.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n > 16 && n % 100 != 0) {
-        return;
-    }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                copy.submitted)
-                          .count();
-    const s64 at = dcb_change != -1 ? dcb_change : ccb_change;
-    std::printf("Command buffers: the guest changed submission %llu's %s at %p +%#llx (%s) "
-                "%.3f ms after submitting it, before it was decoded; %llu of %llu so far "
-                "(decoded from the copy)\n",
-                (unsigned long long)seq, dcb_change != -1 ? "dcb" : "ccb",
-                static_cast<const void*>(dcb_change != -1 ? copy.guest_dcb : copy.guest_ccb),
-                (unsigned long long)((at < -1 ? -2 - at : at) * 4),
-                at < -1 ? "unmapped" : "rewritten", ms, (unsigned long long)n,
-                (unsigned long long)checked.load());
-    if (n > 4 || at < 0) {
-        return;
-    }
-    // What changed, and the packets before it (a WaitRegMem the guest releases after patching,
-    // or a write of ours into its own command buffer).
-    const u32* kept = dcb_change != -1 ? copy.data.data() : copy.data.data() + copy.dcb_dwords;
-    const u32* guest = dcb_change != -1 ? copy.guest_dcb : copy.guest_ccb;
-    const std::size_t dwords = dcb_change != -1 ? copy.dcb_dwords : copy.ccb_dwords;
-    const std::size_t from = at >= 8 ? at - 8 : 0, to = std::min<std::size_t>(dwords, at + 8);
-    std::array<u32, 16> now{};
-    iovec local{now.data(), (to - from) * 4}, remote{const_cast<u32*>(guest + from), (to - from) * 4};
-    const bool readable = process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t((to - from) * 4);
-    std::printf("  submitted:");
-    for (std::size_t i = from; i < to; ++i) {
-        std::printf(i == std::size_t(at) ? " [%08x]" : " %08x", kept[i]);
-    }
-    std::printf("\n  now:      ");
-    for (std::size_t i = from; readable && i < to; ++i) {
-        std::printf(i == std::size_t(at) ? " [%08x]" : " %08x", now[i - from]);
-    }
-    std::printf("\n  packets before it (dword offset:opcode):");
-    std::array<std::pair<u32, u32>, 12> last{};
-    std::size_t count = 0;
-    for (std::size_t p = 0; p < std::size_t(at) && p < dwords;) {
-        const u32 header = kept[p];
-        if ((header >> 30) == 3) {
-            last[count++ % last.size()] = {u32(p), (header >> 8) & 0xff};
-            p += ((header >> 16) & 0x3fff) + 2;
-        } else if ((header >> 30) == 2) {
-            ++p;
-        } else {
-            break;
-        }
-    }
-    for (std::size_t i = count > last.size() ? count - last.size() : 0; i < count; ++i) {
-        std::printf(" %#x:%#x", last[i % last.size()].first, last[i % last.size()].second);
-    }
-    std::printf("\n");
-}
+// The former SubmittedCopy debug routine used Linux-only process_vm_readv and has
+// no declaration in the current Liverpool class. It is intentionally omitted.
 
 } // namespace AmdGpu

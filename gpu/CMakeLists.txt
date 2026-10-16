@@ -153,6 +153,9 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+file(GLOB LAYER_SOURCES CONFIGURE_DEPENDS layer/*.cpp)
+file(GLOB GAME_SOURCES CONFIGURE_DEPENDS games/*.cpp)
+file(GLOB CP_SOURCES CONFIGURE_DEPENDS cp/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
 if (WIN32)
@@ -161,6 +164,7 @@ else()
     set(BBGPU_KIND SHARED)
 endif()
 add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+    ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
@@ -270,6 +274,8 @@ endif()
 if (WIN32)
     enable_language(RC)
     file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
+    # Windows links bbnet into bbgpu; runtime_net is upstream's Linux dlopen adapter.
+    list(FILTER BB_RUNTIME EXCLUDE REGEX "runtime_net\\.c$")
     file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
     add_library(atrac9 STATIC ${BB_ATRAC9})
     target_compile_options(atrac9 PRIVATE -w)
@@ -292,7 +298,8 @@ if (WIN32)
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
-    target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
+    # gpu_capabilities.c queries SDL3 display/gamepad state as well as Vulkan.
+    target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan PkgConfig::SDL3)
     # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
     add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
     target_compile_options(bb-play PRIVATE -municode)
@@ -364,7 +371,9 @@ target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan:
 # bbport online module (gpu/bbnet, libbbnet.so): built when its libraries are there (shell.nix);
 # BB_NET=OFF leaves it out. Without it the port plays offline.
 option(BB_NET "Build the online module (shadNet)" ON)
-if (BB_NET)
+# The native Windows port already defines and links a static 'bbnet' target above.
+# Upstream's optional Linux shared module must not create another target of that name.
+if (BB_NET AND NOT WIN32 AND NOT TARGET bbnet)
     find_package(Protobuf CONFIG QUIET)
     find_package(nlohmann_json CONFIG QUIET)
     find_package(OpenSSL QUIET)

@@ -7,9 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
-#ifndef _WIN32
-#include <dlfcn.h>
-#endif
+#include <cstring>
+#include <string>
+#include "bbport_host_diagnostics.h"
 #include <functional>
 
 #include "bbport_copy.h"
@@ -119,8 +119,28 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     const char* env = std::getenv("BB_VK_RECORD_THREAD");
     if (threaded_recording && !(env && env[0] == '0')) {
         record_chunk = AcquireChunk();
-        recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
-        recording_threaded = true;
+        ordered_chunk = AcquireChunk();
+        // A segment of ~64 KiB of closures is ~60 draws: a frame of ~700 draws gives each
+        // thread several segments, and the render passes a cut reopens stay few.
+        const char* segment_kb = std::getenv("BB_VK_SEGMENT_KB");
+        split_bytes = size_t(segment_kb ? std::max(1, std::atoi(segment_kb)) : 64) * 1024;
+        const u32 count = RecordingThreadCount();
+        for (u32 i = 0; i < count; ++i) {
+            auto worker = std::make_unique<Worker>();
+            if (i == 0) {
+                worker->pool = &command_pool;
+            } else {
+                worker->own_pool = std::make_unique<CommandPool>(instance, &work_semaphore);
+                worker->pool = worker->own_pool.get();
+            }
+            workers.push_back(std::move(worker));
+        }
+        for (u32 i = 0; i < count; ++i) {
+            workers[i]->thread =
+                std::jthread(std::bind_front(&Scheduler::RecorderThread, this), i);
+        }
+        std::printf("GPU: %u Vulkan recording thread%s, segments of %zu KiB\n", count,
+                    count == 1 ? "" : "s", split_bytes / 1024);
     }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
@@ -217,7 +237,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    if (!recording_threaded) {
+    if (workers.empty()) {
         current_cmdbuf.beginRendering(rendering_info);
         CarryResume(true);
         return;
@@ -310,12 +330,8 @@ void Scheduler::TraceDirectRecording(void* caller) {
     }
     std::ranges::sort(top, std::greater{});
     for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
-#ifdef _WIN32
-        struct { const char* dli_fname; void* dli_fbase; } info{nullptr, nullptr};
-#else
         Dl_info info{};
         dladdr(top[i].second, &info);
-#endif
         std::printf("Recorder sync caller: %llu x %s+0x%lx\n",
                     static_cast<unsigned long long>(top[i].first),
                     info.dli_fname ? info.dli_fname : "?",
@@ -449,7 +465,8 @@ void Scheduler::WaitHostCopies() {
 }
 
 void Scheduler::KickRecording(bool force) {
-    if (!recording_threaded) {
+    ProducerScope producer{*this, "KickRecording"};
+    if (workers.empty()) {
         return;
     }
     // Callers kick where nobody holds the raw command buffer: deferral resumes.
@@ -472,10 +489,67 @@ void Scheduler::MaybeSplit() {
         BbToggle::Disabled(BbToggle::ParallelRecording)) {
         return;
     }
-    // bbport: the replacement is taken before the current chunk is handed over, so record_chunk
-    // is never null (see RetireChunk). AcquireChunk() takes recorder_mutex itself.
-    std::unique_ptr<RecordChunk> next = record_chunk->Empty() ? nullptr : AcquireChunk();
-    bool wake;
+    // Cutting inside a render pass closes and reopens it: only after a longer stretch.
+    const size_t bytes = segment_bytes + CurrentChunk().Size();
+    if (bytes < (is_rendering ? 2 * split_bytes : split_bytes)) {
+        return;
+    }
+    if (is_rendering) {
+        CarrySuspend(true);
+        Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+        is_rendering = false;
+        resume_rendering = true;
+    } else {
+        CarrySuspend(false);
+    }
+    if (async_submit) {
+        // Its recording thread ends the segment's command buffer (the pool is that thread's).
+        Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
+    }
+    HandOver();
+    ++current_segment;
+    batch->segments[current_segment] = vk::CommandBuffer{};
+    segment_bytes = 0;
+    active_worker.store(current_segment % workers.size(), std::memory_order_relaxed);
+    // The next command buffer starts without dynamic state: the next draw sets all of it.
+    // Everything else (pipeline, vertex and index buffers, descriptors, push constants) every
+    // draw and dispatch records itself.
+    dynamic_state.Invalidate();
+    CarryResume(false);
+}
+
+void Scheduler::HandOver() {
+    // Entered from inside Record*() on this thread: a fault handler recording mid-command.
+    if (const char* inside = producer_scope_where;
+        inside && (std::strcmp(inside, "Record") == 0 || std::strcmp(inside, "RecordData") == 0 ||
+                   std::strcmp(inside, "RecordOrdered") == 0 ||
+                   std::strcmp(inside, "RetireChunk") == 0)) {
+        ReportProducer("REENTERED recording", u32(gettid()), inside, "HandOver");
+    }
+    ProducerScope producer{*this, "HandOver"};
+    if (!record_chunk || !ordered_chunk) {
+        // Left behind by another HandOver interrupted between handing a chunk over and
+        // taking a new one (see ProducerScope). Recover instead of dereferencing null.
+        ReportProducer("HandOver without a current chunk", producer_tid.load(), "?", "HandOver");
+        if (!record_chunk) {
+            record_chunk = AcquireChunk();
+        }
+        if (!ordered_chunk) {
+            ordered_chunk = AcquireChunk();
+        }
+    }
+    const bool commands = !full_chunks.empty() || !record_chunk->Empty();
+    const bool ordered = !ordered_full.empty() || !ordered_chunk->Empty();
+    if (!commands && !ordered) {
+        return;
+    }
+    // The chunks that take the current ones' places, taken first (AcquireChunk locks
+    // recorder_mutex) and swapped in below: record_chunk and ordered_chunk are never null, not
+    // even for a fault handler recording on this thread meanwhile (issue #100).
+    std::unique_ptr<RecordChunk> next_record = record_chunk->Empty() ? nullptr : AcquireChunk();
+    std::unique_ptr<RecordChunk> next_ordered = ordered_chunk->Empty() ? nullptr : AcquireChunk();
+    Worker& worker = *workers[current_segment % workers.size()];
+    bool wake = false;
     {
         std::scoped_lock lk{recorder_mutex};
         if (commands) {
@@ -496,8 +570,29 @@ void Scheduler::MaybeSplit() {
             worker.queued.store(worker.queue.size(), std::memory_order_release);
             wake = worker.sleeping;
         }
-        if (next) {
-            recorder_queue.push_back(std::exchange(record_chunk, std::move(next)));
+        if (ordered) {
+            // They run after the commands handed over with them (recorded before or among them).
+            const auto queue = [&](std::unique_ptr<RecordChunk> chunk) {
+                chunk->segment = current_segment;
+                chunk->batch = batch;
+                chunk->after = batch->handed[current_segment];
+                ordered_queue.push_back(std::move(chunk));
+            };
+            for (auto& chunk : ordered_full) {
+                queue(std::move(chunk));
+            }
+            if (next_ordered) {
+                ordered_chunk.swap(next_ordered); // next_ordered: the chunk handed over
+                queue(std::move(next_ordered));
+            }
+            ordered_queued.store(ordered_queue.size(), std::memory_order_release);
+            // Any thread may run them; the current segment's thread is woken for them (when it
+            // sleeps): it spins for work anyway, and waking another thread per small copy cost
+            // a few percent of the frame rate on 4 cores / 8 threads. A thread that is awake
+            // picks them up by itself.
+            if (!ordered_running) {
+                wake |= worker.sleeping;
+            }
         }
     }
     full_chunks.clear();
@@ -534,7 +629,7 @@ bool Scheduler::OrderedReady() const {
 }
 
 void Scheduler::SyncRecording() {
-    if (!recording_threaded) {
+    if (workers.empty()) {
         return;
     }
     KickRecording(true);
@@ -721,13 +816,6 @@ void Scheduler::Finish() {
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
-}
-
-void Scheduler::WaitSubmitted() {
-    const u64 tick = CurrentTick();
-    if (tick > 1) {
-        Wait(tick - 1);
-    }
 }
 
 void Scheduler::Wait(u64 tick) {

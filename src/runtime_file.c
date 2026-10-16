@@ -189,6 +189,7 @@ static int translate(const char *guest,char *out,size_t size) {
  * (adhoc/font/dbgfont14h.ccm): files from mods or dumps made elsewhere keep their own case.
  * After a miss, the host path is matched component by component ignoring case; true when it was
  * corrected (same length: only case differs). Only on misses: no cost for found files. */
+#ifndef _WIN32
 static int fix_case(char *path) {
     if (path[0]!='/') return 0;
     char out[1024]="", trial[1024], part[256];
@@ -217,6 +218,7 @@ static int fix_case(char *path) {
     memcpy(path,out,strlen(out)+1);
     return 1;
 }
+#endif
 static int host_flags(int flags) {
     int r;
     switch (flags&3) { case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; }
@@ -298,7 +300,7 @@ static File *get(int fd) {
 /* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
 static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
 /* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
-static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
+
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;

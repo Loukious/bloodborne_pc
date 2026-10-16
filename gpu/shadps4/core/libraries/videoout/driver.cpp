@@ -9,6 +9,8 @@
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <dirent.h>
+#include <unistd.h>
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
@@ -302,6 +304,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 /// DRM clients, RSS) and the parts we know of. GTT holds the game's direct memory (fixed).
 static void PrintMemory() {
     u64 vram_kib = 0, gtt_kib = 0;
+#ifndef _WIN32
     std::vector<u64> clients;
     if (DIR* dir = opendir("/proc/self/fdinfo")) {
         while (const dirent* entry = readdir(dir)) {
@@ -338,6 +341,10 @@ static void PrintMemory() {
         std::fclose(statm);
     }
     const u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+#else
+    // DRM fdinfo and /proc RSS are Linux-only. Vulkan allocation statistics below remain valid.
+    const u64 rss = 0;
+#endif
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);

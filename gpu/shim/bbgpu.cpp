@@ -1,4 +1,5 @@
 #include "bbport_write_log.h"
+#include "bbport_free_check.h"
 #include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
@@ -122,6 +123,36 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 bool MemoryManager::IsValidMapping(VAddr virtual_addr, u64 size) {
     return runtime_memory_is_mapped(virtual_addr, size) != 0;
 }
+namespace {
+// bbport: the mapped region of the last lookup, per thread, valid for the mapping table generation
+// it was read at. The GPU command thread clamps and copies thousands of constant ranges a frame,
+// nearly all within the region of the one before: two calls into the runtime each (~5% of it).
+struct RegionCache {
+    u64 generation = 1; // odd: invalid
+    uintptr_t start = 0, end = 0;
+};
+thread_local RegionCache region_cache;
+
+bool CachedMapped(VAddr address, u64 size) {
+    static const uint64_t* const generation_ptr = runtime_memory_generation();
+    const u64 generation = __atomic_load_n(generation_ptr, __ATOMIC_ACQUIRE);
+    if (generation & 1) {
+        return false; // being changed
+    }
+    auto& cache = region_cache;
+    if (cache.generation == generation && address >= cache.start && address + size <= cache.end) {
+        return true;
+    }
+    uintptr_t start = 0, end = 0;
+    int mapped = 0;
+    if (!runtime_memory_region(address, &start, &end, &mapped) || !mapped) {
+        return false;
+    }
+    cache = {generation, start, end};
+    return address + size <= end;
+}
+} // namespace
+
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     if (size && CachedMapped(virtual_addr, size)) {
         return size;
@@ -373,26 +404,6 @@ ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
-}
-
-extern "C" void bbgpu_mouse_take(double* dx, double* dy, int* wheel_up, int* wheel_down) {
-    double x = 0, y = 0;
-    int up = 0, down = 0;
-    if (g_window) {
-        g_window->TakeMouse(x, y, up, down);
-    }
-    *dx = x;
-    *dy = y;
-    *wheel_up = up;
-    *wheel_down = down;
-}
-
-extern "C" int bbgpu_mouse_captured(void) {
-    return g_window && g_window->MouseCaptured() ? 1 : 0;
-}
-
-extern "C" void bbgpu_mouse_look_enable(int enabled) {
-    Frontend::WindowSDL::EnableMouseLook(enabled != 0);
 }
 
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {

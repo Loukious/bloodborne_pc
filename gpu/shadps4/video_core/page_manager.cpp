@@ -17,11 +17,15 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include "bbport_host_diagnostics.h"
+#ifndef _WIN32
 #include <sys/uio.h>
-#include <dlfcn.h>
+#endif
 #include <string>
 #include <fmt/format.h>
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -103,16 +107,31 @@ struct ImageFaultSite {
 std::array<ImageFaultSite, 256> image_fault_sites;
 
 void NoteFaultSite(void* context, VAddr address) {
+#ifdef _WIN32
+    const auto* c = static_cast<const EXCEPTION_POINTERS*>(context)->ContextRecord;
+    const u64 rip = c->Rip, rbp = c->Rbp, rsp = c->Rsp;
+#else
     const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+    const u64 rip = u64(g[REG_RIP]), rbp = u64(g[REG_RBP]), rsp = u64(g[REG_RSP]);
+#endif
     current_fault_rip = 0;
-    const u64 rip = u64(g[REG_RIP]);
+    const auto read_memory = [](void* dst, u64 src, size_t size) -> size_t {
+#ifdef _WIN32
+        SIZE_T got = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(src), dst, size, &got);
+        return got;
+#else
+        iovec local{dst, size}, remote{reinterpret_cast<void*>(src), size};
+        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        return got > 0 ? size_t(got) : 0;
+#endif
+    };
     const bool guest_code = rip >= GuestImage && rip < GuestImageEnd;
     u64 caller = 0;
     if (guest_code) {
         // The caller: [rbp + 8] when the guest code keeps frames (its memcpy-like leaves do not).
         u64 saved[2] = {};
-        iovec local{saved, sizeof(saved)}, remote{reinterpret_cast<void*>(g[REG_RBP]), sizeof(saved)};
-        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(saved)) &&
+        if (read_memory(saved, rbp, sizeof(saved)) == sizeof(saved) &&
             saved[1] >= GuestImage && saved[1] < GuestImageEnd) {
             caller = saved[1];
         }
@@ -120,10 +139,8 @@ void NoteFaultSite(void* context, VAddr address) {
         // Host code (a libc import the port runs natively, the runtime): the first guest return
         // address on the stack is its guest caller.
         std::array<u64, 64> stack{};
-        iovec local{stack.data(), sizeof(stack)},
-            remote{reinterpret_cast<void*>(g[REG_RSP]), sizeof(stack)};
-        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-        for (ssize_t i = 0; i < got / 8; ++i) {
+        const size_t got = read_memory(stack.data(), rsp, sizeof(stack));
+        for (size_t i = 0; i < got / 8; ++i) {
             if (stack[i] >= GuestImage && stack[i] < GuestImageEnd) {
                 caller = stack[i];
                 break;
@@ -320,7 +337,7 @@ struct PageManager::Impl {
         }
         if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::QueryReads) {
             return rasterizer->OnOcclusionPageAccess(
-                addr, u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]),
+                addr, reinterpret_cast<u64>(Common::GetRip(context)),
                 Common::IsWriteError(context), is_gpu_thread);
         }
         if (Common::IsWriteError(context)) {
@@ -335,7 +352,7 @@ struct PageManager::Impl {
             BbStats::Timer timer{BbStats::t_write_faults};
             const bool handled = rasterizer->OnWriteFault(
                 addr, is_gpu_thread,
-                u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+                reinterpret_cast<u64>(Common::GetRip(context)));
             current_fault_rip = 0;
             return handled;
         } else {
@@ -487,9 +504,15 @@ struct PageManager::Impl {
     template <bool track>
     void UpdateImageTraps(VAddr addr, u64 size) {
         std::call_once(image_watchers_once, [this] {
+#ifdef _WIN32
+            void* mem = VirtualAlloc(nullptr, NUM_ADDRESS_PAGES * sizeof(u16),
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            ASSERT_MSG(mem, "image watcher table");
+#else
             void* mem = mmap(nullptr, NUM_ADDRESS_PAGES * sizeof(u16), PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
             ASSERT_MSG(mem != MAP_FAILED, "image watcher table");
+#endif
             image_watchers = static_cast<u16*>(mem);
         });
         size_t page = addr >> PM_PAGE_BITS;

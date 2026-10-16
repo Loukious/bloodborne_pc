@@ -1,4 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// The Windows runtime uses a pagefile section. Linux dma-buf chunks are unavailable here.
+#include "bbport_guest_memory.h"
+#include <cstdio>
+#include <cstdlib>
+namespace BbGuestMemory {
+bool Usable(const Vulkan::Instance&) { return false; }
+bool PcModelGpu(const Vulkan::Instance&) { return false; }
+bool HostImported() { return false; }
+bool LayerMemory() { return false; }
+vk::ExternalMemoryHandleTypeFlagBits HandleType() { return vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32; }
+void Install(const Vulkan::Instance&) {
+    const char* requested = std::getenv("BB_GUEST_IN_PLACE");
+    if (requested && requested[0] == '1') {
+        std::printf("Guest memory: Windows uses the pagefile-backed memory model with GPU copies\n");
+    }
+}
+const Chunk* Find(std::uint64_t) { return nullptr; }
+} // namespace BbGuestMemory
+#else
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_guest_memory.h"
 
 #include <array>
@@ -736,3 +757,5 @@ const Chunk* Find(std::uint64_t phys) {
     return phys < c->phys + c->size ? c : nullptr;
 }
 } // namespace BbGuestMemory
+
+#endif

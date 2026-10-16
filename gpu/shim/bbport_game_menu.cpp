@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_game_menu.h"
 
-#include <sys/mman.h>
-#include <unistd.h>
+#include "bbport_host_memory.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -286,7 +285,7 @@ void DestroyFunction(u8* f) {
     if (!impl) {
         return;
     }
-    using Destroy = void (*)(void*, int);
+    using Destroy = void (BB_GUEST_ABI *)(void*, int);
     Destroy destroy = (*reinterpret_cast<Destroy**>(impl))[4];
     destroy(impl, impl != f);
     *reinterpret_cast<void**>(f + 0x20) = nullptr;
@@ -296,7 +295,7 @@ void DestroyFunction(u8* f) {
 void DestroyText(u8* text) {
     if (*reinterpret_cast<u64*>(text + 0x28) >= 8) {
         void* allocator = *reinterpret_cast<void**>(text + 0x30);
-        using Free = void (*)(void*, void*);
+        using Free = void (BB_GUEST_ABI *)(void*, void*);
         (*reinterpret_cast<Free**>(allocator))[0x70 / 8](allocator, *reinterpret_cast<void**>(text + 0x10));
     }
     *reinterpret_cast<u64*>(text + 0x28) = 7;
@@ -316,7 +315,7 @@ void DestroyValues(u8* list, std::size_t count_offset) {
 }
 
 void MakeTexts(u8* pair, u32 name, u32 help) {
-    using Make = void* (*)(void*, u32, u32);
+    using Make = void* (BB_GUEST_ABI *)(void*, u32, u32);
     Game<Make>(MakeText)(pair, TextName, name);
     Game<Make>(MakeText)(pair + TextSize, TextHelp, help);
 }
@@ -331,21 +330,21 @@ bool UpscalerAvailable(int i) {
 }
 
 void AddRows(void* page, const std::vector<Row>& rows) {
-    using Push = void (*)(void*, void*);
-    using AddRow = void (*)(void*, void*, int*, void*, const int*);
-    using Make = void* (*)(void*, u32, u32);
+    using Push = void (BB_GUEST_ABI *)(void*, void*);
+    using AddRow = void (BB_GUEST_ABI *)(void*, void*, int*, void*, const int*);
+    using Make = void* (BB_GUEST_ABI *)(void*, u32, u32);
     for (const Row& row : rows) {
         alignas(16) u8 pair[2 * TextSize] = {};
         MakeTexts(pair, row.name, row.help);
         if (row.kind == Kind::Slider || row.kind == Kind::Steps) {
-            using Slider = void (*)(void*, void*, u8*, const u8*);
+            using Slider = void (BB_GUEST_ABI *)(void*, void*, u8*, const u8*);
             Game<Slider>(SliderRow)(page, pair, &bytes[row.field], &default_bytes[row.field]);
             DestroyTexts(pair);
             continue;
         }
         if (row.kind == Kind::Toggle) {
-            using PairRowFn = void (*)(void*, void*, u8*, void*, const u8*);
-            u8* two = static_cast<u8*>(std::aligned_alloc(16, PairListSize));
+            using PairRowFn = void (BB_GUEST_ABI *)(void*, void*, u8*, void*, const u8*);
+            u8* two = static_cast<u8*>(BbHostMemory::AlignedAlloc(16, PairListSize));
             std::memset(two, 0, PairListSize);
             for (std::size_t i = 0; i < 2; ++i) {
                 alignas(16) u8 value[ValueSize] = {};
@@ -356,11 +355,11 @@ void AddRows(void* page, const std::vector<Row>& rows) {
             }
             Game<PairRowFn>(PairRow)(page, pair, &bytes[row.field], two, &default_bytes[row.field]);
             DestroyValues(two, PairCountOffset);
-            std::free(two);
+            BbHostMemory::AlignedFree(two);
             DestroyTexts(pair);
             continue;
         }
-        u8* list = static_cast<u8*>(std::aligned_alloc(16, ListSize));
+        u8* list = static_cast<u8*>(BbHostMemory::AlignedAlloc(16, ListSize));
         std::memset(list, 0, ListSize);
         for (std::size_t i = 0; i < row.choices.size(); ++i) {
             if (row.field == Upscaler && !UpscalerAvailable(int(i))) {
@@ -374,7 +373,7 @@ void AddRows(void* page, const std::vector<Row>& rows) {
         }
         Game<AddRow>(ListRow)(page, pair, &values[row.field], list, &default_values[row.field]);
         DestroyValues(list, ListCountOffset);
-        std::free(list);
+        BbHostMemory::AlignedFree(list);
         DestroyTexts(pair);
     }
 }
@@ -382,19 +381,19 @@ void AddRows(void* page, const std::vector<Row>& rows) {
 std::atomic<const char16_t*> title_override{nullptr}; // while the game builds one of our pages (its menu thread)
 // Called by the game's menu code (guest threads, System V ABI like the game), one set per page.
 template <int P>
-void Rows(void* page, void*) {
+void BB_GUEST_ABI Rows(void* page, void*) {
     LoadValues();
     AddRows(page, pages[P].rows);
 }
 template <int P>
-void* Content(void* a, void* b) {
-    using Open = void* (*)(void*, void*, const char*, void*, u64, u64);
+void* BB_GUEST_ABI Content(void* a, void* b) {
+    using Open = void* (BB_GUEST_ABI *)(void*, void*, const char*, void*, u64, u64);
     title_override = nullptr; // the title was looked up just before
     return Game<Open>(OpenPage)(a, b, Game<const char*>(ControlsLayout),
                                 reinterpret_cast<void*>(&Rows<P>), 0, 0);
 }
 void* Factory(void* out, void* arg, void* content, const char16_t* title) {
-    using Create = void* (*)(void*, void*, void*);
+    using Create = void* (BB_GUEST_ABI *)(void*, void*, void*);
     alignas(16) u8 function[FunctionSize] = {};
     *reinterpret_cast<u64*>(function) = image_base + ContentVtable;
     *reinterpret_cast<void**>(function + 8) = content;
@@ -407,7 +406,7 @@ void* Factory(void* out, void* arg, void* content, const char16_t* title) {
     return out;
 }
 template <int P>
-void* PageFactory(void* out, void* arg) {
+void* BB_GUEST_ABI PageFactory(void* out, void* arg) {
     return Factory(out, arg, reinterpret_cast<void*>(&Content<P>), TextOf(pages[P].name));
 }
 constexpr std::size_t MaxPages = 6;
@@ -417,13 +416,13 @@ void* const factories[MaxPages] = {
     reinterpret_cast<void*>(&PageFactory<4>), reinterpret_cast<void*>(&PageFactory<5>)};
 
 // ---- Hooks ----
-using LookupFn = const char16_t* (*)(void*, u32, u32, u32);
-using AddFn = void* (*)(void*, void*, void*, void*);
+using LookupFn = const char16_t* (BB_GUEST_ABI *)(void*, u32, u32, u32);
+using AddFn = void* (BB_GUEST_ABI *)(void*, void*, void*, void*);
 LookupFn lookup_original = nullptr;
 AddFn add_original = nullptr;
 std::atomic<const void*> screen_sound_text{nullptr};
 
-const char16_t* LookupHook(void* repository, u32 table, u32 category, u32 id) {
+BB_GUEST_ABI const char16_t* LookupHook(void* repository, u32 table, u32 category, u32 id) {
     if (id >= IdBase && id < IdBase + texts.size()) {
         // BB_GAME_MENU_TRACE=1: how often the game asks for our texts (per 2 s).
         static const bool count = [] {
@@ -469,7 +468,7 @@ const char16_t* LookupHook(void* repository, u32 table, u32 category, u32 id) {
 }
 
 void AddItem(void* menu, u32 name, u32 help, void* factory) {
-    using ToFunction = void* (*)(void*, void*);
+    using ToFunction = void* (BB_GUEST_ABI *)(void*, void*);
     alignas(16) u8 pair[2 * TextSize] = {};
     MakeTexts(pair, name, help);
     alignas(16) u8 source[FunctionSize] = {};
@@ -484,7 +483,7 @@ void AddItem(void* menu, u32 name, u32 help, void* factory) {
     DestroyTexts(pair);
 }
 
-void* AddHook(void* menu, void* pair, void* function, void* out) {
+void* BB_GUEST_ABI AddHook(void* menu, void* pair, void* function, void* out) {
     void* result = add_original(menu, pair, function, out);
     const void* screen_sound = screen_sound_text.load();
     if (screen_sound && *reinterpret_cast<const void* const*>(pair) == screen_sound) {
@@ -536,9 +535,8 @@ u8* MapNear(unsigned char* image, u64 image_size, std::size_t size) {
     const u64 base = reinterpret_cast<u64>(image);
     for (u64 k = 1; k <= 64; ++k) {
         for (const u64 hint : {base - k * (24ull << 20), base + image_size + k * (24ull << 20)}) {
-            void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-            if (p != MAP_FAILED) {
+            void* p = BbHostMemory::MapAt(hint, size, BbHostMemory::Read | BbHostMemory::Write);
+            if (p) {
                 return static_cast<u8*>(p);
             }
         }
@@ -553,7 +551,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         return;
     }
     image_base = reinterpret_cast<u64>(image);
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = BbHostMemory::PageSize();
     u8* stubs = MapNear(image, size, page);
     if (!stubs) {
         std::printf("Game menu: no memory near the image, the port's pages are off\n");
@@ -582,7 +580,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
                reinterpret_cast<void*>(&LookupHook), reinterpret_cast<void**>(&lookup_original), cursor) &&
         Detour(image, AddPageItem, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&AddHook), reinterpret_cast<void**>(&add_original), cursor);
-    mprotect(stubs, page, PROT_READ | PROT_EXEC);
+    BbHostMemory::Protect(stubs, page, BbHostMemory::Read | BbHostMemory::Execute);
     std::printf("Game menu: %s (%zu pages in System)\n", ok ? "the port's pages are in" : "hooks failed, off",
                 pages.size());
 }

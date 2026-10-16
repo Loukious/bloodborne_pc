@@ -596,7 +596,33 @@ private:
     std::array<std::unique_ptr<Buffer>, 256> chunk_buffers{}; ///< per guest memory chunk (Chunk::index)
 
     u32 arena_memory_type_index{};
-    u32 arena_memory_type_bits{}; ///< bbport: the types the arena accepts (system memory fallback)
+    /// bbport: system memory for residency when VRAM is full (4 GB cards), if sparse binding takes it
+    std::optional<u32> arena_fallback_type_index;
+    u32 arena_memory_type_bits = 0; ///< memory types the arena's blocks can be bound to
+    vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
+    u64 residency_size = 0, residency_used = 0;
+    std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background
+    /// bbport: VRAM blocks no longer needed. Per 2 MiB of guest addresses, the second
+    /// (BbStats::coarse_second) it was last bound: blocks in VRAM unused for BB_VRAM_IDLE_SECONDS
+    /// (60, 0: never) go back to the game's memory, and residency chunks left without blocks
+    /// go back to the driver (ProcessIdleBlocks). Blocks of unmapped memory leave VRAM too.
+    static constexpr u64 USE_GROUP_BITS = 21;
+    std::vector<u32> group_use;
+    /// Groups with blocks moved in place for idleness, and those blocks: bound again, they get a
+    /// VRAM copy again (QueuePromotions). Else the GPU kept reading them over PCIe (FPS 90 -> 55).
+    std::vector<u8> group_demoted;
+    IntervalList<> idle_demoted;
+    struct ResidencyChunk {
+        u64 size;
+        u64 used;         ///< bytes handed out and not returned
+        u32 empty_second; ///< when `used` dropped to 0
+        u64 empty_tick;   ///< the submission then being recorded (it carries the rebinds)
+        std::vector<u64> free_offsets; ///< slots of blocks that left (byte offsets)
+        u32 evacuated_second = 0;      ///< when its blocks were last sent away (ProcessIdleBlocks)
+    };
+    std::unordered_map<VkDeviceMemory, ResidencyChunk> residency_chunks;
+    u32 idle_scan_second = 0;
+    u32 last_evacuation = 0; ///< ProcessIdleBlocks: when a chunk was last emptied
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};
