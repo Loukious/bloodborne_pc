@@ -266,11 +266,11 @@ void Menu() {
         for (int i = 0; i < BbSettings::PresetCount; ++i) {
             char label[64];
             const float scale = BbSettings::PresetScale(i);
-            const int output = s.output_res;
+            const auto output = BbSettings::OutputSize(s.output_res);
             std::snprintf(label, sizeof(label), "%s (x%.1f, render %dx%d)",
                           BbSettings::PresetName(i), scale,
-                          int(std::lround(BbSettings::OutputWidths[output] / scale / 2) * 2),
-                          int(std::lround(BbSettings::OutputHeights[output] / scale / 2) * 2));
+                          int(std::lround(output.width / scale / 2) * 2),
+                          int(std::lround(output.height / scale / 2) * 2));
             if (ImGui::Selectable(label, i == preset)) {
                 Store(s.preset, i, true);
             }
@@ -326,15 +326,16 @@ void Menu() {
     ImGui::EndDisabled(); // upscaler off
 
     ImGui::SeparatorText("Output resolution");
-    static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
-                                    "2560 x 1080 (21:9)", "3440 x 1440 (21:9)",
-                                    "3840 x 1600 (21:9)", "5120 x 2160 (21:9)",
-                                    "3840 x 1080 (32:9)", "5120 x 1440 (32:9)"};
-    static_assert(sizeof(outputs) / sizeof(*outputs) == BbSettings::OutputCount);
-    int output = s.output_res;
-    if (ImGui::BeginCombo("Output resolution", outputs[output])) {
-        for (int i = 0; i < BbSettings::OutputCount; ++i) {
-            if (ImGui::Selectable(outputs[i], i == output)) {
+    const auto& outputs = BbSettings::OutputResolutions();
+    const int output = s.output_res;
+    const auto size = BbSettings::OutputSize(output);
+    char selected[48];
+    std::snprintf(selected, sizeof(selected), "%d x %d", size.width, size.height);
+    if (ImGui::BeginCombo("Output resolution", selected)) {
+        for (int i = 0; i < int(outputs.size()); ++i) {
+            char label[48];
+            std::snprintf(label, sizeof(label), "%d x %d", outputs[i].width, outputs[i].height);
+            if (ImGui::Selectable(label, i == output)) {
                 Store(s.output_res, i, true);
             }
         }

@@ -333,7 +333,7 @@ bool TemporalUpscaler::OnFrameStart() {
                 value < BbSettings::PresetCount) {
                 BbSettings::Get().preset.store(value);
             }
-            if (fields >= 2 && output >= 0 && output < BbSettings::OutputCount) {
+            if (fields >= 2 && output >= 0 && output < BbSettings::OutputOptionCount()) {
                 BbSettings::Get().output_res.store(output);
             }
             if (fields == 3 && provider >= 0 && provider < BbSettings::UpscalerCount) {
@@ -356,8 +356,9 @@ bool TemporalUpscaler::OnFrameStart() {
     const int output = settings.output_res.load();
     const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
-        target_width = BbSettings::OutputWidths[output];
-        target_height = BbSettings::OutputHeights[output];
+        const auto size = BbSettings::OutputSize(output);
+        target_width = size.width;
+        target_height = size.height;
         std::printf("Output resolution: %ux%u (live)\n", target_width, target_height);
         failed = false;
         fsr4_failed = false;

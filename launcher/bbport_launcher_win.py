@@ -225,6 +225,33 @@ OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 
            ('2560x1080', ('2560 × 1080 (21:9)',)), ('3440x1440', ('3440 × 1440 (21:9)',)),
            ('3840x1600', ('3840 × 1600 (21:9)',)), ('5120x2160', ('5120 × 2160 (21:9)',)),
            ('3840x1080', ('3840 × 1080 (32:9)',)), ('5120x1440', ('5120 × 1440 (32:9)',))]
+_display_outputs = None
+
+
+def output_options(current):
+    """Keep presets and the saved size, adding the modes reported by connected displays."""
+    global _display_outputs
+    if _display_outputs is None:
+        _display_outputs = []
+        exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
+        if not exe.is_file():
+            exe = PORT_DIR / 'out' / 'bb-gpu-capabilities.exe'
+        if exe.is_file():
+            try:
+                result = subprocess.run([str(exe), '--display-modes'], capture_output=True,
+                                        text=True, timeout=5, creationflags=NO_WINDOW)
+                if result.returncode == 0:
+                    _display_outputs = result.stdout.splitlines()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    options = dict(OUTPUTS)
+    for value in [*_display_outputs, current]:
+        match = re.fullmatch(r'(\d+)x(\d+)', str(value))
+        if match and all(2 <= int(v) <= 16384 for v in match.groups()):
+            options.setdefault(value, (value.replace('x', ' × '),))
+    return [(value, options[value]) for value in sorted(options, key=lambda v: tuple(map(int, v.split('x'))))]
+
+
 # Vertical field of view in degrees (scripts/fov.py; the game's camera has 43).
 FOVS = [('43', ('Game (43°)', 'Как в игре (43°)')), *((str(d), (f'{d}°',)) for d in (50, 55, 60, 65, 70, 75, 80, 90))]
 
@@ -887,7 +914,7 @@ class Launcher:
         self.row(quick, _('Frame rate', 'Частота кадров'), self.choice(quick, 'fps_mode', 'app', FPS_MODES, 26))
         self.row(quick, _('Upscaler', 'Апскейлер'), self.choice(quick, 'upscaler', 'ini', UPSCALERS, 26))
         self.row(quick, _('Preset', 'Пресет'), self.choice(quick, 'preset', 'ini', PRESETS, 26))
-        self.row(quick, _('Output', 'Разрешение'), self.choice(quick, 'output_res', 'ini', OUTPUTS, 26))
+        self.row(quick, _('Output', 'Разрешение'), self.choice(quick, 'output_res', 'ini', output_options(self.var('output_res', 'ini').get()), 26))
         ttk.Checkbutton(quick, text=_('Fullscreen', 'Полный экран'), variable=self.var('fullscreen', 'app')).grid(
             row=self.next_row(quick), column=1, sticky='w', pady=(8, 0))
         ttk.Checkbutton(quick, text=_('Play online'), variable=self.var('online', 'app')).grid(
@@ -953,7 +980,7 @@ class Launcher:
         self.row(f, _('Quality preset', 'Пресет'), self.choice(f, 'preset', 'ini', PRESETS),
                  _('Render scale per axis: Quality renders at 1/1.5 of the output size.',
                    'Масштаб рендера по каждой оси: Quality рисует в 1/1.5 размера вывода.'))
-        self.row(f, _('Output resolution', 'Разрешение вывода'), self.choice(f, 'output_res', 'ini', OUTPUTS),
+        self.row(f, _('Output resolution', 'Разрешение вывода'), self.choice(f, 'output_res', 'ini', output_options(self.var('output_res', 'ini').get())),
                  _('What the upscaler produces; the HUD is drawn at this size too.',
                    'Что выдаёт апскейлер; интерфейс рисуется в этом же размере.'))
         self.row(f, _('HUD position (ultrawide)', 'Положение интерфейса (21:9)'),

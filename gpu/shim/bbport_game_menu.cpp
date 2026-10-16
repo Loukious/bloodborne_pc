@@ -202,12 +202,6 @@ void DefineTexts() {
         Kind::Steps);
     row(Sharpness, "Sharpness", "Резкость", "RCAS after the upscaler: 0 off, 10 strongest",
         "RCAS после апскейлера: 0 выкл, 10 сильнее всего", {}, Kind::Slider);
-    row(OutputRes, "Output resolution", "Разрешение вывода",
-        "Final frame: 0-1 1280x720, 2-4 1920x1080, 5-7 2560x1440, 8-10 3840x2160",
-        "Готовый кадр: 0-1 1280x720, 2-4 1920x1080, 5-7 2560x1440, 8-10 3840x2160",
-        {AddText("1280 x 720", "1280 x 720"), AddText("1920 x 1080", "1920 x 1080"),
-         AddText("2560 x 1440", "2560 x 1440"), AddText("3840 x 2160", "3840 x 2160")},
-        Kind::Steps);
     row(ShowFps, "FPS counter", "Счётчик FPS", "Frame rate in the top right corner",
         "Частота кадров в правом верхнем углу", toggle);
     row(ModelLod, "Model detail", "Детализация",
@@ -216,11 +210,21 @@ void DefineTexts() {
         {AddText("Highest", "Максимальная"), AddText("Game default", "Как в игре"),
          AddText("Lower", "Ниже"), AddText("Lowest", "Минимальная")},
         Kind::Steps);
-    // The page's only pop-up list, last: it opens below itself.
     row(Upscaler, "Upscaler", "Апскейлер", "Temporal upscaler and anti-aliasing",
         "Временной апскейлер и сглаживание",
         {off, AddText("FSR 3.1", "FSR 3.1"), AddText("FSR 4", "FSR 4"), AddText("FSR 4.1.1", "FSR 4.1.1"),
-         AddText("TAA", "TAA"), AddText("DLSS", "DLSS")});
+         AddText("TAA", "TAA"), AddText("DLSS", "DLSS")}, Kind::Steps);
+    // Only the final row uses a pop-up list, so it does not overlap the rows below it.
+    // A slider's eleven positions cannot represent all the monitor's display modes.
+    std::vector<u32> output_choices;
+    for (const auto size : BbSettings::OutputResolutions()) {
+        const std::string label = std::to_string(size.width) + " x " + std::to_string(size.height);
+        output_choices.push_back(AddText(label.c_str(), label.c_str()));
+    }
+    row(OutputRes, "Output resolution", "Разрешение вывода",
+        "Final frame size; includes connected display modes. Aspect ratio changes require a restart.",
+        "Размер кадра, включая режимы подключённых экранов. Смена пропорций требует перезапуска.",
+        std::move(output_choices));
 
     page("Effects", "Эффекты", "The game's effects (bbport; after a restart)",
          "Эффекты игры (bbport; после перезапуска)");
@@ -616,7 +620,7 @@ void Poll() {
         return;
     }
     auto& s = BbSettings::Get();
-    s.output_res = std::clamp(values[OutputRes], 0, BbSettings::OutputCount - 1);
+    s.output_res = std::clamp(values[OutputRes], 0, BbSettings::OutputOptionCount() - 1);
     const int upscaler = std::clamp(values[Upscaler], 0, BbSettings::UpscalerCount - 1);
     s.upscaler = UpscalerAvailable(upscaler) ? upscaler : int(BbSettings::UpscalerFsr3);
     s.preset = std::clamp(values[Preset], 0, BbSettings::PresetCount - 1);

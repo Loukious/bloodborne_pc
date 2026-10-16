@@ -39,6 +39,13 @@ Starting
   (left half), Backspace touchpad (right half). Xbox controllers: Back + d-pad left/right clicks
   the left/right touchpad half (gestures / key items), Back alone the left half.
 
+Output resolution
+- The launcher, Insert overlay and in-game Display page include the resolutions Windows reports
+  for connected displays, including 2880x1620 when supported. Existing presets remain available.
+- The selected output is saved in bbport.ini and retained on the next launch. Resolution changes
+  may need a game restart with startup scaling enabled; changes of aspect ratio need a restart.
+- The selection controls the rendered output size; it does not change the Windows desktop mode.
+
 Data
 - Saves and shader caches: user\ next to Bloodborne.exe (the launcher can pick another folder).
 - Settings: bbport.ini next to Bloodborne.exe; launcher options in %APPDATA%\bbport-launcher.

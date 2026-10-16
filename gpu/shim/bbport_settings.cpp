@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_settings.h"
+#include "bbport_display_modes.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -81,8 +82,9 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "fov") {
         v.fov = std::clamp(i, FovMin, FovMax);
     } else if (key == "output_res") {
-        for (int r = 0; r < OutputCount; ++r) {
-            if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
+        const auto& outputs = OutputResolutions();
+        for (int r = 0; r < int(outputs.size()); ++r) {
+            if (value == std::to_string(outputs[r].width) + "x" + std::to_string(outputs[r].height)) {
                 v.output_res = r;
             }
         }
@@ -96,6 +98,39 @@ void Set(Values& v, const std::string& key, const std::string& value) {
 }
 
 } // namespace
+
+const std::vector<OutputResolution>& OutputResolutions() {
+    // Immutable after initialization: settings, window, renderer and guest menu threads all
+    // use these indices. Read the saved custom size here too, before any menu caches its list.
+    static const auto outputs = [] {
+        std::vector<OutputResolution> result{{1280, 720}, {1920, 1080}, {2560, 1440},
+            {3840, 2160}, {2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160},
+            {3840, 1080}, {5120, 1440}};
+        const auto add = [](int width, int height, void* context) {
+            auto& list = *static_cast<std::vector<OutputResolution>*>(context);
+            if (width < 2 || height < 2 || width > 16384 || height > 16384) return;
+            if (std::none_of(list.begin(), list.end(), [=](const auto& size) {
+                    return size.width == width && size.height == height;
+                })) list.push_back({width, height});
+        };
+#ifdef _WIN32
+        BbEnumerateDisplayModes(add, &result);
+#endif
+        if (FILE* file = std::fopen(Path(), "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), file)) {
+                int width = 0, height = 0;
+                char extra = 0;
+                if (std::sscanf(line, "output_res=%dx%d %c", &width, &height, &extra) == 2) {
+                    add(width, height, &result);
+                }
+            }
+            std::fclose(file);
+        }
+        return result;
+    }();
+    return outputs;
+}
 
 Values& Get() {
     static Values values;
@@ -214,7 +249,9 @@ bool ResolutionNeedsRestart() {
     const auto& v = Get();
     // TAA needs the live path (native guest targets): run.sh selects it on restart. Ultrawide
     // outputs patch the camera and HUD at startup.
-    if (Ultrawide(v.output_res) != Ultrawide(v.startup_output_res)) return true;
+    const auto output = OutputSize(v.output_res);
+    const auto startup = OutputSize(v.startup_output_res);
+    if (output.width * startup.height != startup.width * output.height) return true;
     if (Ultrawide(v.output_res) && v.hud_position != v.startup_hud_position) return true;
     return FixedRenderSession() &&
         (v.preset != v.startup_preset || v.output_res != v.startup_output_res ||
@@ -254,7 +291,8 @@ void Save() {
         put(Effects[e].key, flag(v.effects[e]));
     }
     put("model_lod", std::to_string(v.model_lod.load()));
-    put("output_res", std::to_string(OutputWidths[v.output_res]) + "x" + std::to_string(OutputHeights[v.output_res]));
+    const auto output = OutputSize(v.output_res);
+    put("output_res", std::to_string(output.width) + "x" + std::to_string(output.height));
     put("mute_unfocused", flag(v.mute_unfocused));
     static constexpr const char* prompts[PromptsCount] = {"auto", "playstation", "keyboard"};
     put("button_prompts", prompts[std::clamp(v.button_prompts.load(), 0, PromptsCount - 1)]);

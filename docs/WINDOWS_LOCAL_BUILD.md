@@ -65,6 +65,18 @@ Local validation logs, the package hash manifest and screenshots are retained un
 Game validation used an isolated directory and copied saves; the installed game and BBSC
 configuration were not modified.
 
+## Display resolutions
+
+Windows output choices combine the original presets, modes reported by active desktop displays,
+and the saved `output_res=WIDTHxHEIGHT` setting. The launcher queries `bb-gpu-capabilities.exe
+--display-modes`; the overlay and the game's Display menu use the same native enumeration.
+Dimensions are limited to 2..16384 pixels per axis. Choices are deduplicated by width and height,
+so refresh rates do not create duplicate entries. Modes are discovered when the application starts.
+
+The renderer uses the selected dimensions rather than a fixed preset table. Aspect ratio changes
+require a restart to apply the camera/HUD startup patches. Selecting an output does not switch the
+Windows desktop display mode. The original ten preset indices remain stable for diagnostic scripts.
+
 ## Current limits
 
 - Hands-on direct mouse-camera responsiveness and automatic keyboard/controller prompt switching

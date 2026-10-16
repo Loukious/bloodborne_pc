@@ -10,6 +10,7 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 #include <SDL3/SDL.h>
+#include "../gpu/shim/bbport_display_modes.h"
 
 static VkDeviceSize largest_local_heap(VkPhysicalDevice device) {
     VkPhysicalDeviceMemoryProperties memory;
@@ -203,7 +204,22 @@ static int read_input(const char *kind) {
     return 0;
 }
 
+#ifdef _WIN32
+static void print_display_mode(int width, int height, void* context) {
+    (void)context;
+    printf("%dx%d\n", width, height);
+}
+#endif
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--display-modes")) {
+#ifdef _WIN32
+        BbEnumerateDisplayModes(print_display_mode, NULL);
+        return 0;
+#else
+        return 1;
+#endif
+    }
     if (argc > 1 && !strcmp(argv[1], "--read-input")) {
         return read_input(argc > 2 ? argv[2] : "any");
     }
